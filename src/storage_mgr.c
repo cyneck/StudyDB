@@ -1,282 +1,228 @@
-/**
- * @file storage_mgr.c
- * @authors Xingli Li
- * @date 2023-07-29
- * @brief Page-file creation, block I/O, navigation, and capacity management.
- */
-
+//
+// Created by Eric,wolfplus, Yang Li on 2023/7/14.
+//
+#include "dberror.h"
 #include "storage_mgr.h"
-//#include <stdlib.h>
+
+#include <stdlib.h>
 #include <string.h>
-//#include <error.h>
 
-/**
- * Define the file header with 2 integers.
- * The first one is recording total number of pages which is 1 by default.
- * The second one is recording the page size which is 4096(2^12) by default.
- */
-int fileHeader[2];
+/* =========================================================================
+ * Storage Manager - page-file layer
+ *
+ * A page file is treated as a sequence of fixed-size pages (PAGE_SIZE bytes
+ * each). SM_FileHandle is a lightweight cursor: it remembers which file it
+ * refers to, how many pages the file has, and the current page position.
+ *
+ * Key design points:
+ *   - readBlock/writeBlock address pages by number; writeBlock implicitly
+ *     grows the file by one page when writing right past the end
+ *     (pageNum == totalNumPages).
+ *   - appendEmptyBlock/ensureCapacity grow the file explicitly; the buffer
+ *     manager uses them to extend tables on demand.
+ *   - There is deliberately NO in-memory cache here. That is the buffer
+ *     manager's job (chapter 2); this layer only does dumb block I/O.
+ * ========================================================================= */
 
-/**
- * @brief The initialization of the Storage Manager，initialize the file header.
- */
+/* This function is used to initialize the storage manager */
 void initStorageManager(void) {
-    printf("WELCOME TO DATABASE!\n");
-    fileHeader[0] = 1;
-    fileHeader[1] = PAGE_SIZE;
+    // No initialization required for this simple storage manager.
+    // fp = NULL;
 }
 
-/**
- * @brief Create a new page file fileName. The initial file size should be one page.
- * This method should fill this single page with ’\0’ bytes.
- * @param fileName the name of page file
- * @return an integer return code also defined in dberror.h
- */
+/* This function creates a new page file fileName. The initial file length should be one page. */
 RC createPageFile(char *fileName) {
-    int iRet = RC_OK;
+    FILE *fp = fopen(fileName, "w+"); // Open file in read/write mode, create it if it does not exist.
+    if (fp == NULL)
+        return RC_FILE_NOT_FOUND;
 
-    // open a binary file with "wb+" mode
-    FILE *fp = fopen(fileName, "wb+");
-    if (NULL == fp) {
-        iRet = RC_FILE_NOT_FOUND;
-    } else {
-        // write the file header, after the file create
-        if (fwrite(fileHeader, sizeof(int), 2, fp) != 2) {
-            iRet = RC_WRITE_FAILED;
-        }
-        // the single page fill with '\0' bytes
-        char fillPageZero[PAGE_SIZE] = {'\0'};
-        if (fwrite(fillPageZero, sizeof(char), PAGE_SIZE, fp) != PAGE_SIZE) {
-            iRet = RC_WRITE_FAILED;
-        }
+    SM_PageHandle *page = calloc(PAGE_SIZE, sizeof(char)); // Create an empty page.
+    memset(page, '\0', PAGE_SIZE);
+    fwrite(page, PAGE_SIZE, 1, fp);
 
-        fclose(fp);
-    }
-
-    return iRet;
+    free(page);
+    fclose(fp);
+    return RC_OK;
 }
 
-/**
- * @brief Opens an existing page file
- * @param fileName the name of page file
- * @param fHandle A file handle represents an open page file
- * @return an integer return code also defined in dberror.h, return RC_FILE_NOT_FOUND if the file does not exist
- */
+
+/* This function opens an existing page file. */
 RC openPageFile(char *fileName, SM_FileHandle *fHandle) {
-    int iRet = RC_OK;
-
-    FILE *fp = fopen(fileName, "r+");
-    if (NULL == fp) {
-        iRet = RC_FILE_NOT_FOUND;
-    } else {
-        // assign page file info to attributes of the file handle
-        fHandle->mgmtInfo = (void *) fp;
-        fHandle->fileName = fileName;
-        fHandle->curPagePos = 0;
-        // init the total page number by reading the file header
-        if (!fread(&fHandle->totalNumPages, sizeof(int), 1, fp)) {
-            iRet = RC_FILE_HANDLE_NOT_INIT;
-        }
+    if (NULL == fileName) {
+        return RC_FILE_NOT_FOUND;
     }
-    return iRet;
+    if (NULL == fHandle) {
+        return RC_FILE_HANDLE_NOT_INIT;
+    }
+    FILE *fp = fopen(fileName, "r+"); // Open file in read/write mode.
+    if (fp == NULL)
+        return RC_FILE_NOT_FOUND;
+    fseek(fp, 0L, SEEK_END);
+    int fileLength = ftell(fp);   // Calculate the total of pages in the file using a constant page size.
+    rewind(fp);
+
+    fHandle->fileName = fileName;
+    fHandle->totalNumPages = fileLength / PAGE_SIZE;
+    fHandle->curPagePos = 0;
+    fHandle->mgmtInfo = fp;
+
+    return RC_OK;
 }
 
-/**
- * @brief close an open page file
- * @param fHandle A file handle represents an open page file
- * @return an integer return code also defined in dberror.h
- */
+/* This function closes an open page file. */
 RC closePageFile(SM_FileHandle *fHandle) {
-    int iRet = RC_OK;
-    if (0 == fclose((FILE *) fHandle->mgmtInfo)) {
-        // set the pointer to be NULL after close the file
-        fHandle->mgmtInfo = NULL;
-    } else {
-        iRet = RC_FILE_NOT_FOUND;
-    }
+    if (NULL == fHandle || NULL == fHandle->mgmtInfo)
+        return RC_FILE_HANDLE_NOT_INIT;
 
-    return iRet;
+    fHandle->fileName = NULL;
+    fHandle->totalNumPages = 0;
+    fHandle->curPagePos = -1;
+    FILE *fp = fHandle->mgmtInfo;
+    fclose(fp);
+//    fclose(fp);
+
+    return RC_OK;
 }
 
-
-/**
- * @brief destroy (delete) a page file
- * @param fileName the name of page file
- * @return an integer return code also defined in dberror.h
- */
+/* This function destroys a page file. The file will no longer exist after running this method. */
 RC destroyPageFile(char *fileName) {
-    int iRet = RC_OK;
-    if (remove(fileName) != 0) {
-        iRet = RC_FILE_NOT_FOUND;
-    }
-
-    return iRet;
+//    fclose(fp);
+    remove(fileName);
+    return RC_OK;
 }
 
 
-/**
- * @brief read the block at position pageNum from a file and
- * stores its content in the memory pointed to by the memPage page handle.
- * @param pageNum target reading position
- * @param fHandle a file handle represents an open page file
- * @param memPage a page handler to store target content in the memory
- * @return an integer return code also defined in dberror.h
- */
+/* Read a page from disk into memory. */
 RC readBlock(int pageNum, SM_FileHandle *fHandle, SM_PageHandle memPage) {
-    int iRet = RC_OK;
-    // set the current page position to the target page number
-    fHandle->curPagePos = pageNum;
+    if (fHandle == NULL)
+        return RC_FILE_HANDLE_NOT_INIT;
 
-    // move the file internal pointer to target position
-    if (fseek((FILE *) fHandle->mgmtInfo, getBlockPos(fHandle), SEEK_SET)) {
-        iRet = RC_READ_NON_EXISTING_PAGE;
-    }
-        // read the page data and store in the page handler
-    else if (fread(memPage, PAGE_SIZE, 1, (FILE *) fHandle->mgmtInfo) != 1) {
-        iRet = RC_READ_NON_EXISTING_PAGE;
-    }
+    if (pageNum < 0)
+        return RC_READ_NON_EXISTING_PAGE;
 
-    return iRet;
+    FILE *fp = fHandle->mgmtInfo;
+    fseek(fp, pageNum * PAGE_SIZE, SEEK_SET);
+    int pageSize = fread(memPage, sizeof(char), PAGE_SIZE, fp);
+//    if (pageSize != PAGE_SIZE) {
+//        return RC_READ_NON_EXISTING_PAGE;
+//    }
+
+    fHandle->curPagePos = ftell(fp) / PAGE_SIZE;
+    return RC_OK;
 }
 
-/**
- * @brief get the current page position in a file
- * @param fHandle A file handle represents an open page file
- * @return the current page position in a file
- */
+/* Get the current block position. */
 int getBlockPos(SM_FileHandle *fHandle) {
-    // calculate the number of bytes in the position of the current block.
-    // current block position = header size + (page size * current position)
-    int iRet = sizeof(fileHeader) + (PAGE_SIZE * fHandle->curPagePos);
-    return iRet;
+    if (fHandle == NULL)
+        return RC_FILE_HANDLE_NOT_INIT;
+
+    return fHandle->curPagePos;
 }
 
-/**
- * @brief Read the first page of the open file
- * @param fHandle A file handle represents an open page file
- * @param memPage a page handler to store target content in the memory
- * @return an integer return code also defined in dberror.h
- */
+/* Read the first block of the file. */
 RC readFirstBlock(SM_FileHandle *fHandle, SM_PageHandle memPage) {
     return readBlock(0, fHandle, memPage);
 }
 
-/**
- * @brief Read the previous page of the open file relative to current page
- * @param fHandle A file handle represents an open page file
- * @param memPage a page handler to store target content in the memory
- * @return an integer return code also defined in dberror.h
- */
+/* Read the previous block relative to the current block position. */
 RC readPreviousBlock(SM_FileHandle *fHandle, SM_PageHandle memPage) {
+    if (fHandle == NULL)
+        return RC_FILE_HANDLE_NOT_INIT;
+
+    if (fHandle->curPagePos <= 0)
+        return RC_READ_NON_EXISTING_PAGE;
+
     return readBlock(fHandle->curPagePos - 1, fHandle, memPage);
 }
 
-/**
- * @brief Read the current page of the open file
- * @param fHandle A file handle represents an open page file
- * @param memPage a page handler to store target content in the memory
- * @return an integer return code also defined in dberror.h
- */
+/* Read the block at the current block position. */
 RC readCurrentBlock(SM_FileHandle *fHandle, SM_PageHandle memPage) {
+    if (fHandle == NULL)
+        return RC_FILE_HANDLE_NOT_INIT;
+
     return readBlock(fHandle->curPagePos, fHandle, memPage);
 }
 
-/**
- * @brief Read the next page of the open file relative to current page
- * @param fHandle A file handle represents an open page file
- * @param memPage a page handler to store target content in the memory
- * @return an integer return code also defined in dberror.h
- */
+/* Read the next block relative to the current block position. */
 RC readNextBlock(SM_FileHandle *fHandle, SM_PageHandle memPage) {
+    if (fHandle == NULL)
+        return RC_FILE_HANDLE_NOT_INIT;
+
+    if (fHandle->curPagePos >= fHandle->totalNumPages - 1)
+        return RC_READ_NON_EXISTING_PAGE;
+
     return readBlock(fHandle->curPagePos + 1, fHandle, memPage);
 }
 
-/**
- * @brief Read the last page of the open file
- * @param fHandle A file handle represents an open page file
- * @param memPage a page handler to store target content in the memory
- * @return an integer return code also defined in dberror.h
- */
+/* Read the last block of the file. */
 RC readLastBlock(SM_FileHandle *fHandle, SM_PageHandle memPage) {
+    if (fHandle == NULL)
+        return RC_FILE_HANDLE_NOT_INIT;
+
     return readBlock(fHandle->totalNumPages - 1, fHandle, memPage);
 }
 
 
-/**
- * @brief write a page to disk with target position
- * @param pageNum target writing position
- * @param fHandle A file handle represents an open page file
- * @param memPage a page handler to store target content in the memory
- * @return an integer return code also defined in dberror.h
- */
+/* Writes a page to disk from memory. */
 RC writeBlock(int pageNum, SM_FileHandle *fHandle, SM_PageHandle memPage) {
-    int iRet = RC_OK;
+    if (fHandle == NULL)
+        return RC_FILE_HANDLE_NOT_INIT;
 
-    // set the current page position to the target page number
-    fHandle->curPagePos = pageNum;
+    if (pageNum < 0)
+        return RC_WRITE_FAILED;
 
-    // move the file internal pointer to target position
-    if (fseek((FILE *) fHandle->mgmtInfo, getBlockPos(fHandle), SEEK_SET)) {
-        iRet = RC_WRITE_FAILED;
+    FILE *fp = fHandle->mgmtInfo;
+    fseek(fp, pageNum * PAGE_SIZE, SEEK_SET);
+
+    if (fwrite(memPage, sizeof(char), PAGE_SIZE, fp) != PAGE_SIZE)
+        return RC_WRITE_FAILED;
+
+    fflush(fp);
+    fHandle->curPagePos = ftell(fp) / PAGE_SIZE;
+    if (pageNum == fHandle->totalNumPages) {
+        fHandle->totalNumPages += 1;
     }
-        // write the page data to the target block
-    else if (fwrite(memPage, sizeof(char), PAGE_SIZE, (FILE *) fHandle->mgmtInfo) != PAGE_SIZE) {
-        iRet = RC_WRITE_FAILED;
-    }
-
-    return iRet;
+    return RC_OK;
 }
 
-/**
- * @brief write a page to disk with current position
- * @param fHandle A file handle represents an open page file
- * @param memPage a page handler to store target content in the memory
- * @return an integer return code also defined in dberror.h
- */
+/* Writes the current block to disk from memory. */
 RC writeCurrentBlock(SM_FileHandle *fHandle, SM_PageHandle memPage) {
+    if (fHandle == NULL)
+        return RC_FILE_HANDLE_NOT_INIT;
+
     return writeBlock(fHandle->curPagePos, fHandle, memPage);
 }
 
-/**
- * @brief Increase the number of pages in the file by one with zero bytes
- * @param fHandle A file handle represents an open page file
- * @return an integer return code also defined in dberror.h
- */
+/* Appends an empty block to the end of a file. */
 RC appendEmptyBlock(SM_FileHandle *fHandle) {
-    int iRet = RC_OK;
-    char fillPageZero[PAGE_SIZE] = {'\0'};
+    if (fHandle == NULL)
+        return RC_FILE_HANDLE_NOT_INIT;
 
-    // increase the total page number by 1
+    FILE *fp = fHandle->mgmtInfo;
+    fseek(fp, 0L, SEEK_END);
+
+    char *block = calloc(PAGE_SIZE, sizeof(char));
+    if (fwrite(block, sizeof(char), PAGE_SIZE, fp) != PAGE_SIZE)
+        return RC_WRITE_FAILED;
+
+    fflush(fp);
     fHandle->totalNumPages += 1;
-
-    // move the file internal pointer to end position
-    if (fseek((FILE *) fHandle->mgmtInfo, 0, SEEK_SET)) {
-        iRet = RC_WRITE_FAILED;
-    } else if (fwrite(&fHandle->totalNumPages, sizeof(int), 2, (FILE *) fHandle->mgmtInfo) != 2) {
-        iRet = RC_WRITE_FAILED;
-    }
-
-    if (fseek((FILE *) fHandle->mgmtInfo, 0, SEEK_END)) {
-        iRet = RC_WRITE_FAILED;
-    } else if (fwrite(fillPageZero, sizeof(char), PAGE_SIZE, (FILE *) fHandle->mgmtInfo) != PAGE_SIZE) {
-        iRet = RC_WRITE_FAILED;
-    }
-
-    return iRet;
+    free(block);
+    return RC_OK;
 }
 
-/**
- * @brief If the file has less than numberOfPages pages then increase the size to numberOfPages
- * @param numberOfPages
- * @param fHandle A file handle represents an open page file
- * @return an integer return code also defined in dberror.h
- */
+/* If the file has less than numberOfPages pages then increase the size to numberOfPages. */
 RC ensureCapacity(int numberOfPages, SM_FileHandle *fHandle) {
-    int iRet = RC_OK;
-    while (numberOfPages > fHandle->totalNumPages && iRet == RC_OK) {
-        iRet = appendEmptyBlock(fHandle);
+    if (fHandle == NULL)
+        return RC_FILE_HANDLE_NOT_INIT;
+
+    if (fHandle->totalNumPages < numberOfPages) {
+        int additionalPages = numberOfPages - fHandle->totalNumPages;
+        int i = 0;
+        for (i = 0; i < additionalPages; i++) {
+            if (appendEmptyBlock(fHandle) != RC_OK)
+                return RC_WRITE_FAILED;
+        }
     }
-
-    return iRet;
+    return RC_OK;
 }
-

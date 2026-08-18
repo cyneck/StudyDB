@@ -55,6 +55,7 @@ typedef struct RM_TableData
 	char *name;
 	Schema *schema;
 	void *mgmtData;
+	int numTuples;
 } RM_TableData;
 
 #define MAKE_STRING_VALUE(result, value)				\

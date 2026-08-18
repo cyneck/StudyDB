@@ -76,6 +76,16 @@ A buffer pool is several pieces working together in memory:
 
 ## 2.3 关键数据结构
 
+> **⚠️ 实现差异说明（2026-08 换用 cs525-s23-11 实现后）**
+> 本章 2.2 的 pinPage 流程、2.3 的数据结构、2.5 的逐行讲，描述的其实是**教科书经典实现**：`BM_MgmtData` + 哈希表 + 空闲链表 + `isOpen` 字段。
+> 本仓库**实际代码** `src/buffer_mgr.c` 已换成另一套更简单的设计：
+> - 用**双向链表 + `BufferFrame`**（内含 dirty / fixCount / entryTimestamp / accessTimestamp），`bm->mgmtData` 指向该链表；
+> - 查找是**线性遍历链表**，没有哈希表（缓冲池规模小，线性查找足够直观）；
+> - 替换策略只实现 **FIFO（按 entryTimestamp）** 与 **LRU（按 accessTimestamp）**，其余策略返回 -1；
+> - `pinPage` 对不存在的页会 `appendEmptyBlock` 按需扩文件。
+>
+> 公开 API（§2.6）完全不变，上层调用方式一致。以下经典设计（哈希表、装填因子、LRU-K）仍是很好的学习材料，值得保留阅读；若要对照真实代码，请直接看 `src/buffer_mgr.c` 文件头注释。
+
 **中文**
 
 公开的句柄 `BM_BufferPool` 只放对外接口需要的字段，真正的实现细节藏在 `mgmtData` 里：

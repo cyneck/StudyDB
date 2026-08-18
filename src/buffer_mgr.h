@@ -134,4 +134,6 @@ int getNumReadIO(BM_BufferPool *const bm);
 
 int getNumWriteIO(BM_BufferPool *const bm);
 
+int getTotalNumPages(BM_BufferPool *const bm);
+
 #endif

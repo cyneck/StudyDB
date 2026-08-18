@@ -1,6 +1,6 @@
 # 第3章 · 记录管理器 Record Manager
 
-> 对应源文件：`record_mgr.c` / `record_mgr.h` / `record_mgr_ex.h` / `tables.h`
+> 对应源文件：`record_mgr.c` / `record_mgr.h` / `tables.h`
 >
 > 第1章把磁盘抽象成「页的序列」，第2章把页缓存在内存里。但用户视角里没有「页」——他们看到的是「表、行、列」。**记录管理器（Record Manager）**就是这两层之上的翻译官：把定长页组织成「带 schema 的记录集合」。
 
@@ -47,39 +47,36 @@ There's a big gap here: **fixed 4096-byte pages vs. a collection of variable-len
 ```
 ┌──────────┬──────────────┬──────────────┬─────┬──────────────┐
 │  page 0  │   page 1     │   page 2     │ ... │   page N     │
-│ Schema   │  数据页 1    │  数据页 2    │     │  数据页 N    │
-│ (序列化) │              │              │     │              │
+│ Schema + │  数据页 1    │  数据页 2    │     │  数据页 N    │
+│ numTuples│              │              │     │              │
 └──────────┴──────────────┴──────────────┴─────┴──────────────┘
 ```
 
-- **page 0** 存「Schema 元信息」：序列化后的 `Schema` + 表的当前数据页数 `numPageOfTable`
-- **page 1..N** 是**数据页**，每页内部布局：
+- **page 0** 存「Schema 元信息 + 元组数」：序列化后的 `Schema` + 当前元组数 `numTuples`（见 3.4.2）。
+- **page 1..N** 是**数据页**，每页由固定大小的槽组成：
 
 ```
-┌──────────────┬──────────┬──────────┬─────┬──────────┐
-│ numRecords  │ record 0 │ record 1 │ ... │ record K │
-│ (4 bytes)   │          │          │     │          │
-└──────────────┴──────────┴──────────┴─────┴──────────┘
-                  ↑ slot 0   ↑ slot 1        ↑ slot K
+┌─────────────┬─────────────┬─────────────┬─────┬─────────────┐
+│   slot 0    │   slot 1    │   slot 2    │ ... │   slot K    │
+├─────────────┴─────────────┴─────────────┴─────┴─────────────┤
+│ 每个槽 = [ marker(1B) | 记录字节(recordSize) ]，共 recordSize+2 字节   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-`numRecords` 既记录当前页有多少条记录，又兼任「页满」标记——页满了就置 `-1`，下次插入直接开新页。
+槽的**标记字节（marker）**决定槽的状态：
 
-**记录本身**是一条紧凑的字节串，各属性按 Schema 顺序拼接，按 offset 访问：
-
-```
-┌──────────┬──────────┬──────────┬─────┐
-│  attr 0  │  attr 1  │  attr 2  │ ... │
-│ offset 0 │ offset S0│ offset S0+S1 │   │
-└──────────┴──────────┴──────────┴─────┘
-```
+- `'+'`：已占用（槽里有一条有效记录）
+- `'-'`：墓碑——记录被删了，字节还在但逻辑上已删（见 3.4.4）
+- `'\0'`：从未使用过（新页由 `createPageFile` 全零填充）
 
 **RID → 字节偏移公式**：给定 `RID = (page, slot)`，记录在所在页内的字节偏移是
 
 ```
-offset = slot × recordSize + sizeof(int)
-                                ↑ 跳过 numRecords 头
+offset = slot × (recordSize + 2) + 1
+         ↑ 跳过 marker 字节
 ```
+
+每个槽都固定占 `recordSize + 2` 字节（1 字节标记 + 定长记录），所以删记录不会让任何槽变小、RID 永远指向同一个槽——这是「标记 + 定长槽」模型的核心权衡。
 
 **English**
 
@@ -88,32 +85,36 @@ A table file on disk looks like this:
 ```
 ┌──────────┬──────────────┬──────────────┬─────┬──────────────┐
 │  page 0  │   page 1     │   page 2     │ ... │   page N     │
-│ Schema   │  data pg 1   │  data pg 2   │     │  data pg N   │
-│ (serial) │              │              │     │              │
+│ Schema + │  data pg 1   │  data pg 2   │     │  data pg N   │
+│ numTuples│              │              │     │              │
 └──────────┴──────────────┴──────────────┴─────┴──────────────┘
 ```
 
-- **page 0** stores Schema metadata: the serialized `Schema` + the current number of data pages `numPageOfTable`.
-- **page 1..N** are **data pages**. Each data page is laid out as:
+- **page 0** stores the schema metadata + the current tuple count `numTuples` (see 3.4.2).
+- **page 1..N** are **data pages**, each made of fixed-size slots:
 
 ```
-┌──────────────┬──────────┬──────────┬─────┬──────────┐
-│ numRecords  │ record 0 │ record 1 │ ... │ record K │
-│ (4 bytes)   │          │          │     │          │
-└──────────────┴──────────┴──────────┴─────┴──────────┘
-                  ↑ slot 0   ↑ slot 1        ↑ slot K
+┌─────────────┬─────────────┬─────────────┬─────┬─────────────┐
+│   slot 0    │   slot 1    │   slot 2    │ ... │   slot K    │
+├─────────────┴─────────────┴─────────────┴─────┴─────────────┤
+│ each slot = [ marker(1B) | record bytes(recordSize) ], total recordSize+2 bytes │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-`numRecords` both counts records in the page and acts as a "page full" marker — set to `-1` when the page is full, so the next insert goes straight to a new page.
+A slot's **marker byte** encodes its state:
 
-**A record** is a compact byte string: attributes are concatenated in Schema order and accessed by offset.
+- `'+'`: occupied — a live record lives here
+- `'-'`: tombstone — the record was deleted; bytes remain but it is logically gone (see 3.4.4)
+- `'\0'`: never used (new pages are zero-filled by `createPageFile`)
 
 **RID → byte offset formula**: given `RID = (page, slot)`, the record's in-page byte offset is
 
 ```
-offset = slot × recordSize + sizeof(int)
-                                ↑ skip numRecords header
+offset = slot × (recordSize + 2) + 1
+         ↑ skip the marker byte
 ```
+
+Every slot is a fixed `recordSize + 2` bytes (1 marker + fixed-length record), so deleting a record never resizes a slot and a RID always points at the same slot — the key trade-off of the marker + fixed-slot model.
 
 ---
 
@@ -142,25 +143,23 @@ typedef struct Schema {
 
 `Schema` 是一张表的「形状说明书」：要建表就得先有它。`typeLength` 只对 `DT_STRING` 有意义（定长字符串），其他类型的大小由 `dataTypes` 决定——`DT_INT` 占 4 字节、`DT_FLOAT` 占 4 字节、`DT_BOOL` 占 1 字节。
 
-扩展类型（`record_mgr_ex.h`，**内部使用，不对用户暴露**）：
+扩展类型（本实现不再用 `record_mgr_ex.h`，改成两个更简化的做法）：
 
-```c
-typedef struct RM_PageSlot  { int page_id; int slot_id; } PageSlot;        // 内部定位
-typedef struct RM_TableInfo { int numOfTuples; } TableInfo;                // 表级元数据
-typedef struct RM_Scanner   { int page; int slot; Expr *cond; } Scanner;  // 扫描状态
-```
+- 扫描状态结构是 `record_mgr.c` 内部的 `RM_ScanInfo`：记录当前页/槽、扫描条件，以及**扫描开始时的表总页数** `totalPages`（扫描用它当上界，见 3.4.5）。
+- 元组数不再塞进 `mgmtData`，而是直接成为 `RM_TableData` 的字段 `numTuples`。
 
 `RM_TableData` 是用户拿到表的句柄：
 
 ```c
 typedef struct RM_TableData {
-    char *name;
-    Schema *schema;
-    void *mgmtData;   // 装着 TableInfo（当前表里有多少条 tuple）
+    char *name;       // 表名
+    Schema *schema;   // 表结构
+    void *mgmtData;   // 装着缓冲池句柄（BM_BufferPool*）
+    int numTuples;    // 当前元组数：closeTable 写回 page 0，openTable 恢复
 } RM_TableData;
 ```
 
-`mgmtData` 用 `void*` 跟第1章的 `SM_FileHandle.mgmtInfo` 是一个套路——信息隐藏，让上层只关心表语义，不暴露内部 `TableInfo` 结构。
+`mgmtData` 用 `void*` 跟第1章的 `SM_FileHandle.mgmtInfo` 是一个套路——信息隐藏，让上层只关心表语义，不暴露内部缓冲池结构。
 
 **English**
 
@@ -185,25 +184,23 @@ typedef struct Schema {
 
 `Schema` is the "shape spec" of a table — you must build one before creating a table. `typeLength` only matters for `DT_STRING` (fixed-length strings); other types' sizes are determined by `dataTypes` — `DT_INT` is 4 bytes, `DT_FLOAT` is 4 bytes, `DT_BOOL` is 1 byte.
 
-Extension types (`record_mgr_ex.h`, **internal, not exposed to users**):
+Extension types (this implementation drops `record_mgr_ex.h` in favor of two simpler choices):
 
-```c
-typedef struct RM_PageSlot  { int page_id; int slot_id; } PageSlot;        // internal location
-typedef struct RM_TableInfo { int numOfTuples; } TableInfo;                // table-level metadata
-typedef struct RM_Scanner   { int page; int slot; Expr *cond; } Scanner;  // scan state
-```
+- The scan state is `RM_ScanInfo`, internal to `record_mgr.c`: it holds the current page/slot, the scan condition, and the table's **total page count at scan start** `totalPages` (used as the scan bound, see 3.4.5).
+- The tuple count lives directly on `RM_TableData` as `numTuples`, not inside `mgmtData`.
 
 `RM_TableData` is the user-facing table handle:
 
 ```c
 typedef struct RM_TableData {
-    char *name;
-    Schema *schema;
-    void *mgmtData;   // holds a TableInfo (how many tuples are in the table)
+    char *name;       // table name
+    Schema *schema;   // table schema
+    void *mgmtData;   // holds the buffer pool handle (BM_BufferPool*)
+    int numTuples;    // tuple count: persisted to page 0 by closeTable, restored by openTable
 } RM_TableData;
 ```
 
-`mgmtData` is `void*` for the same information-hiding reason as `SM_FileHandle.mgmtInfo` in Chapter 1 — upper layers see only table semantics, not the internal `TableInfo` struct.
+`mgmtData` is `void*` for the same information-hiding reason as `SM_FileHandle.mgmtInfo` in Chapter 1 — upper layers see only table semantics, not the internal buffer-pool structure.
 
 ---
 
@@ -230,7 +227,7 @@ int getRecordSize(Schema *schema) {
 }
 ```
 
-注意：字符串是**定长**的（长度由 `typeLength[i]` 决定），不是 C 字符串那种以 `\0` 结尾的变长。这样每条记录长度都相同，第 N 条记录的偏移就能用 `slot × recordSize` 直接算出来——这是「定长记录」模型的关键权衡。
+注意：字符串是**定长**的（长度由 `typeLength[i]` 决定），不是 C 字符串那种以 `\0` 结尾的变长。这样每条记录长度都相同，第 N 个槽的偏移就能用 `slot × (recordSize + 2)` 直接算出来（+2 是槽的标记字节）——这是「定长记录 + 标记槽」模型的关键权衡。
 
 **English**
 
@@ -251,54 +248,55 @@ int getRecordSize(Schema *schema) {
 }
 ```
 
-Note: strings are **fixed-length** (length given by `typeLength[i]`), not C-string-style variable-with-`\0`. This keeps every record the same length, so the Nth record's offset is simply `slot × recordSize`. This fixed-length-record trade-off is what makes slot-based addressing work.
+Note: strings are **fixed-length** (length given by `typeLength[i]`), not C-string-style variable-with-`\0`. This keeps every record the same length, so the Nth slot's offset is simply `slot × (recordSize + 2)` (the +2 being the slot's marker byte). This fixed-length-record + marker-slot trade-off is what makes slot-based addressing work.
 
 ---
 
-### 3.4.2 Schema 持久化：saveTableSchema / readTableSchema
+### 3.4.2 Schema 持久化：writeTableSchema / openTable
 
 **中文**
 
-表关掉再打开时，`Schema` 必须能从磁盘读回。`saveTableSchema` 把 Schema 序列化到 page 0（schema 太大可能溢出到 page 1+，所以 `numPagesOfSchema` 也一并记下）：
+表关掉再打开时，`Schema` 必须能从磁盘读回。本实现的 `writeTableSchema` 把 Schema + 元组数序列化到 page 0（schema 太大可能溢出到 page 1+，所以 `numPagesOfSchema` 也一并记下）。注意它**直接通过存储管理器写文件**（`writeBlock`），不经过缓冲池——建表时表还没打开，没有缓冲池可用：
 
 ```c
-RC saveTableSchema(Schema *schema) {
-    int sizeSchema = sizeof(int) * (3 + schema->numAttr * 3 + schema->keySize)
-                   + sizeof(DataType) * schema->numAttr;
-    int attrNameOffset = sizeSchema;            // 字符串区从元数据区之后开始
-    int offset = 0;
+static RC writeTableSchema(SM_FileHandle *fh, Schema *schema, int numTuples) {
     int i;
+
+    int sizeSchema = sizeof(int) * (4 + schema->numAttr * 3 + schema->keySize)
+                     + sizeof(DataType) * schema->numAttr;
     for (i = 0; i < schema->numAttr; i++)
         sizeSchema += strlen(schema->attrNames[i]) + 1;
 
     int numPagesOfSchema = (sizeSchema - 1) / PAGE_SIZE + 1;
-    char *buffer = (char *) malloc(PAGE_SIZE * numPagesOfSchema);
-    memset(buffer, '\0', PAGE_SIZE * numPagesOfSchema);
-    int numPageOfTable = 0;
+    char *buffer = (char *) calloc(numPagesOfSchema, PAGE_SIZE);
+    if (buffer == NULL) return RC_RM_MEM_ALLOC_FAILED;
 
-    MEMCPY_TO_OFFSET(&numPagesOfSchema, int);
-    MEMCPY_TO_OFFSET(&numPageOfTable, int);
-    MEMCPY_TO_OFFSET(&(schema->numAttr), int);
-    MEMCPY_TO_OFFSET(&(schema->keySize), int);
+    int attrNameOffset = sizeSchema;   // 字符串区从元数据区之后开始
+    int offset = 0;
+
+    memcpy(buffer + offset, &numPagesOfSchema, sizeof(int)); offset += sizeof(int);
+    memcpy(buffer + offset, &numTuples,         sizeof(int)); offset += sizeof(int);
+    memcpy(buffer + offset, &schema->numAttr,   sizeof(int)); offset += sizeof(int);
+    memcpy(buffer + offset, &schema->keySize,   sizeof(int)); offset += sizeof(int);
 
     for (i = 0; i < schema->numAttr; i++) {
-        int slen = strlen(schema->attrNames[i]) + 1;
-        MEMCPY_TO_OFFSET(&attrNameOffset, int);
-        MEMCPY_TO_OFFSET(&slen, int);
-        MEMCPY_TO_OFFSET(&(schema->dataTypes[i]), DataType);
-        MEMCPY_TO_OFFSET(&(schema->typeLength[i]), int);
-        memcpy(&(buffer[attrNameOffset]), schema->attrNames[i], slen);
-        attrNameOffset += slen;
+        int nameLen = strlen(schema->attrNames[i]) + 1;
+        memcpy(buffer + offset, &attrNameOffset, sizeof(int));    offset += sizeof(int);
+        memcpy(buffer + offset, &nameLen,        sizeof(int));    offset += sizeof(int);
+        memcpy(buffer + offset, &schema->dataTypes[i],  sizeof(DataType)); offset += sizeof(DataType);
+        memcpy(buffer + offset, &schema->typeLength[i], sizeof(int));       offset += sizeof(int);
+        memcpy(buffer + attrNameOffset, schema->attrNames[i], nameLen);
+        attrNameOffset += nameLen;
     }
-    for (i = 0; i < schema->keySize; i++)
-        MEMCPY_TO_OFFSET(&(schema->keyAttrs[i]), int);
+    for (i = 0; i < schema->keySize; i++) {
+        memcpy(buffer + offset, &schema->keyAttrs[i], sizeof(int)); offset += sizeof(int);
+    }
 
-    for (i = 0; i < numPagesOfSchema; i++) {
-        pinPage(pBuffP, pPageH, i);
-        memcpy(pPageH->data, &(buffer[i * PAGE_SIZE]), PAGE_SIZE);
-        markDirty(pBuffP, pPageH);
-        unpinPage(pBuffP, pPageH);
-    }
+    for (i = 0; i < numPagesOfSchema; i++)
+        if (writeBlock(i, fh, buffer + i * PAGE_SIZE) != RC_OK) {
+            free(buffer);
+            return RC_WRITE_FAILED;
+        }
     free(buffer);
     return RC_OK;
 }
@@ -307,26 +305,18 @@ RC saveTableSchema(Schema *schema) {
 page 0 的字节布局：
 
 ```
-┌──────────────┬──────────────┬─────────┬─────────┬───────────────┬─────────────┐
-│numPagesOfSchem│numPageOfTable│ numAttr │ keySize │ 每列元信息×N  │ keyAttrs×K  │ ... │ attrNames 区 │
-│   (int)       │   (int)      │ (int)   │ (int)   │ offset,slen,  │  (int×K)    │     │ (字符串拼接) │
-│              │              │         │         │ dataType,typLen│            │     │              │
-└──────────────┴──────────────┴─────────┴─────────┴───────────────┴─────────────┘
+┌──────────────┬──────────┬─────────┬─────────┬───────────────┬─────────────┐
+│numPagesOfSche│ numTuples│ numAttr │ keySize │ 每列元信息×N  │ keyAttrs×K  │ ... │ attrNames 区 │
+│   (int)      │  (int)   │ (int)   │ (int)   │ offset,slen,  │  (int×K)    │     │ (字符串拼接) │
+│              │          │         │         │ dataType,typLen│            │     │              │
+└──────────────┴──────────┴─────────┴─────────┴───────────────┴─────────────┘
 ```
 
-`MEMCPY_TO_OFFSET` 是 `record_mgr_ex.h` 里的宏：把数据拷到 `buffer[offset]` 然后把 `offset` 往前推 `sizeof(type)` 字节——等价于「写入 + seek」：
-
-```c
-#define MEMCPY_TO_OFFSET(__expression__, __type__)               \
-    memcpy(&(buffer[offset]), __expression__, sizeof(__type__)); \
-    offset += sizeof(__type__)
-```
-
-`readTableSchema` 是镜像操作：先从 page 0 读出 `numPagesOfSchema`，把那几页读进 buffer，然后按相反顺序反序列化回 `Schema*`。
+`createTable` 调它（numTuples 传 0）把 schema 写进新文件。`openTable` 是镜像操作：先把 page 0 读进缓冲池，读出 `numPagesOfSchema` 和 `numTuples`，把那几页读入 buffer，按相反顺序反序列化回 `Schema*`（用 `createSchema` 重建，属性名字符串重新 malloc），并把 `numTuples` 赋给 `rel->numTuples`。`closeTable` 则在关表前把内存里的 `numTuples` 写回 page 0 的 `[4..7]`——这样「close → reopen」之后元组数能存活。
 
 **English**
 
-When a table is closed and reopened, its Schema must be readable from disk. `saveTableSchema` serializes the Schema into page 0 (large schemas may spill onto page 1+, so `numPagesOfSchema` is also stored):
+When a table is closed and reopened, its Schema must be readable from disk. Our `writeTableSchema` serializes the Schema + tuple count into page 0 (large schemas may spill onto page 1+, so `numPagesOfSchema` is stored too). Note it writes **directly through the storage manager** (`writeBlock`) rather than through the buffer pool — at create time the table is not open, so no pool exists yet:
 
 ```c
 // (same code as above)
@@ -335,22 +325,14 @@ When a table is closed and reopened, its Schema must be readable from disk. `sav
 Page 0 byte layout:
 
 ```
-┌──────────────┬──────────────┬─────────┬─────────┬───────────────┬─────────────┐
-│numPagesOfSchem│numPageOfTable│ numAttr │ keySize │ per-attr meta×N│ keyAttrs×K  │ ... │ attrNames area │
-│   (int)       │   (int)      │ (int)   │ (int)   │ offset,slen,  │  (int×K)    │     │ (concatenated) │
-│              │              │         │         │ dataType,typLen│            │     │              │
-└──────────────┴──────────────┴─────────┴─────────┴───────────────┴─────────────┘
+┌──────────────┬──────────┬─────────┬─────────┬───────────────┬─────────────┐
+│numPagesOfSche│ numTuples│ numAttr │ keySize │ per-attr meta×N│ keyAttrs×K  │ ... │ attrNames area │
+│   (int)      │  (int)   │ (int)   │ (int)   │ offset,slen,  │  (int×K)    │     │ (concatenated) │
+│              │          │         │         │ dataType,typLen│            │     │              │
+└──────────────┴──────────┴─────────┴─────────┴───────────────┴─────────────┘
 ```
 
-`MEMCPY_TO_OFFSET` is a macro in `record_mgr_ex.h`: it copies data into `buffer[offset]` and then advances `offset` by `sizeof(type)` — equivalent to "write + seek":
-
-```c
-#define MEMCPY_TO_OFFSET(__expression__, __type__)               \
-    memcpy(&(buffer[offset]), __expression__, sizeof(__type__)); \
-    offset += sizeof(__type__)
-```
-
-`readTableSchema` is the mirror operation: it first reads `numPagesOfSchema` from page 0, loads those pages into a buffer, then deserializes back into a `Schema*` in reverse order.
+`createTable` calls it (numTuples = 0) to write the schema into the fresh file. `openTable` is the mirror: it pins page 0, reads `numPagesOfSchema` and `numTuples`, loads those pages into a buffer, deserializes back into a `Schema*` (rebuilt via `createSchema`, with freshly malloc'd attribute-name strings), and stores `numTuples` into `rel->numTuples`. `closeTable` writes the in-memory `numTuples` back to page 0 `[4..7]` before shutting the pool down — so the count survives a close → reopen round trip.
 
 ---
 
@@ -358,78 +340,60 @@ Page 0 byte layout:
 
 **中文**
 
-`insertRecord` 的流程：**读 `numPageOfTable` → 找末页 → 看是否满 → 写入 → 更新 `numRecords` → 回填 RID**。
+`insertRecord` 的流程：**从第 1 页开始逐页找空 → 数每页已占用槽 → 有空就插 → 回填 RID**。不需要在 page 0 记「数据页数」——`pinPage` 碰到不存在的页会自动把文件扩一页（见第 2 章），循环到表末尾时自然就开了新页：
 
 ```c
 RC insertRecord(RM_TableData *rel, Record *record) {
-    int numPagesOfTable = 0;
-    pinPage(pBuffP, pPageH, 0);
-    memcpy(&numPagesOfTable, pPageH->data + sizeof(int), sizeof(int)); // 从 page 0 读数据页数
-    unpinPage(pBuffP, pPageH);
+    int recordSize = getRecordSize(rel->schema);
+    int numSlots = getRecordsPerPage(rel->schema);
 
-    Schema *schema = rel->schema;
-    PageSlot pos;
-    int numRecordInPage = 0;
+    int curPageNum = 1;                 // 数据从 page 1 开始
+    bool foundPage = false;
 
-    if (0 == numPagesOfTable) {                                 // 表里还没有数据页
-        numPagesOfTable++;
-        updateNumPageOfTable(numPagesOfTable);
-        numRecordInPage = 0;
-        pinPage(pBuffP, pPageH, 1);                            // 初始化第 1 页
-        memcpy(pPageH->data, &numRecordInPage, sizeof(int));
-        markDirty(pBuffP, pPageH); unpinPage(pBuffP, pPageH);
-        forceFlushPool(pBuffP);
-        pos.page_id = numPagesOfTable; pos.slot_id = 0;
-    } else {                                                    // 读末页的 numRecords
-        int tmpNum = 0;
-        pinPage(pBuffP, pPageH, numPagesOfTable);
-        memcpy(&tmpNum, pPageH->data, sizeof(int));
-        unpinPage(pBuffP, pPageH);
-        pos.page_id = numPagesOfTable; pos.slot_id = tmpNum;
+    while (!foundPage) {
+        BM_PageHandle pageHandle;
+        if (pinPage(rel->mgmtData, &pageHandle, curPageNum) != RC_OK)
+            return RC_RM_BUFFER_PIN_FAILED;
 
-        if (tmpNum == -1) {                                     // 末页已满，开新页
-            numPagesOfTable++;
-            updateNumPageOfTable(numPagesOfTable);
-            numRecordInPage = 0;
-            pinPage(pBuffP, pPageH, numPagesOfTable);
-            memcpy(pPageH->data, &numRecordInPage, sizeof(int));
-            markDirty(pBuffP, pPageH); unpinPage(pBuffP, pPageH);
-            forceFlushPool(pBuffP);
-            pos.page_id = numPagesOfTable; pos.slot_id = 0;
+        // 找页内第一个空槽（标记 != '+'：未用 '\0' 或墓碑 '-'）
+        int slotNum = -1;
+        for (int i = 0; i < numSlots; i++) {
+            int offset = i * (recordSize + 2);
+            if (pageHandle.data[offset] != '+') { slotNum = i; break; }
         }
+
+        if (slotNum >= 0) {                                     // 这页还有空位
+            int offset = slotNum * (recordSize + 2);
+            memcpy(pageHandle.data + offset + 1, record->data, recordSize);
+            pageHandle.data[offset] = '+';                      // 槽标记置为占用
+            record->id.page = curPageNum;
+            record->id.slot = slotNum;
+
+            if (markDirty(rel->mgmtData, &pageHandle) != RC_OK)
+                return RC_RM_MARK_DIRTY_FAILED;
+            rel->numTuples++;                                   // 内存里的元组数 +1
+            if (unpinPage(rel->mgmtData, &pageHandle) != RC_OK)
+                return RC_RM_BUFFER_UNPIN_FAILED;
+            return RC_OK;
+        }
+        unpinPage(rel->mgmtData, &pageHandle);                  // 这页满了，看下一页
+        curPageNum++;
     }
-
-    record->id.page = pos.page_id;
-    record->id.slot = pos.slot_id;
-
-    int recordSize = getRecordSize(schema);
-    int offset = pos.slot_id * recordSize + sizeof(int);        // 跳过 numRecords 头
-    pinPage(pBuffP, pPageH, numPagesOfTable);
-    memcpy((char *) pPageH->data + offset, record->data, recordSize);
-
-    numRecordInPage = pos.slot_id + 1;
-    if ((numRecordInPage + 1) * recordSize + sizeof(int) > PAGE_SIZE)
-        numRecordInPage = -1;                                   // 写完这条页就满，标记 -1
-    memcpy(pPageH->data, &numRecordInPage, sizeof(int));
-    markDirty(pBuffP, pPageH); unpinPage(pBuffP, pPageH);
-    forceFlushPool(pBuffP);
-
-    numOfTuples++;
-    ((TableInfo *) rel->mgmtData)->numOfTuples++;
     return RC_OK;
 }
 ```
 
 关键点：
 
-- **末页满标记**：`numRecords = -1` 表示「这页满了，下一条插入直接开新页」，避免了反复扫描找空槽。
+- **页满检测靠找空槽**：每页扫一遍 `numSlots` 个槽，遇到第一个标记不是 `'+'` 的槽就是空位。代价是 O(每页槽数)，但实现简单直观。
+- **插入位置 = 第一个空槽**：插入时复用页内第一个空槽——无论是从未用过的 `'\0'` 槽还是删除留下的墓碑 `'-'` 槽。这样既不会覆盖仍占用的记录，也能回收墓碑空间（见 3.4.4 的讨论）。
+- **文件按需增长**：`pinPage` 遇到 `curPageNum` 超出文件页数会自动 `appendEmptyBlock` 扩一页，所以循环必然终止，无需手动维护「数据页数」。
 - **RID 即返回值**：插入成功后 `record->id` 被填上 `(page, slot)`，调用方拿到就能用于后续 `getRecord` / `deleteRecord`。
-- **页满判断靠算术**：因为 `recordSize` 固定，`(numRecordInPage + 1) * recordSize + sizeof(int) > PAGE_SIZE` 这一简单的算术就能判断「下一条还塞不塞得下」。
-- **`markDirty` + `forceFlushPool`**：写完立即刷盘，保证崩溃一致性；代价是性能（每次插入都触发 I/O）。
+- **`markDirty` + `unpin`**：只标记脏页、释放 pin，真正的刷盘交给缓冲池（关表时 `forceFlushPool` 统一写回），不在每次插入时刷盘。
 
 **English**
 
-`insertRecord` flow: **read `numPageOfTable` → find last page → check if full → write → update `numRecords` → backfill RID**.
+`insertRecord` flow: **walk pages from page 1 → count occupied slots per page → if there is room, insert → backfill RID**. No data-page count is kept on page 0 — `pinPage` auto-grows the file when asked for a page that does not exist yet (chapter 2), so the loop naturally opens a new page when it reaches the end of the table:
 
 ```c
 // (same code as above)
@@ -437,10 +401,11 @@ RC insertRecord(RM_TableData *rel, Record *record) {
 
 Key points:
 
-- **Full-page marker**: `numRecords = -1` means "this page is full, next insert goes to a new page" — avoids repeatedly scanning for free slots.
+- **Page-full check by counting slots**: each page's `numSlots` markers are scanned and the `'+'` ones counted; fewer than `numSlots` means there is room. Costs O(slots per page), but it is simple and easy to follow.
+- **Insert position = count of occupied slots**: the new record lands in the slot right after the last occupied one, rather than the first free slot — so tombstone (`'-'`) slots left by deletes are not immediately reused (see the discussion in 3.4.4).
+- **On-demand file growth**: `pinPage` calls `appendEmptyBlock` when `curPageNum` is past the end of the file, so the loop is guaranteed to terminate without manually tracking a "number of data pages".
 - **RID is the return value**: on success, `record->id` is filled with `(page, slot)`, which the caller can pass to `getRecord` / `deleteRecord`.
-- **Page-full check by arithmetic**: because `recordSize` is constant, the simple check `(numRecordInPage + 1) * recordSize + sizeof(int) > PAGE_SIZE` is enough to tell whether the next record still fits.
-- **`markDirty` + `forceFlushPool`**: flush to disk immediately after each write for crash consistency — at the cost of performance (every insert triggers I/O).
+- **`markDirty` + `unpin`**: only marks the page dirty and releases the pin; the actual flush is left to the buffer pool (`forceFlushPool` at close), not per-insert.
 
 ---
 
@@ -448,61 +413,68 @@ Key points:
 
 **中文**
 
-直接把记录从页里抹掉会破坏 `slot × recordSize` 的偏移公式（后面的记录会错位）。本实现用了最朴素的**墓碑（tombstone）**：把记录头三个字节写成 `-D-`，物理上不删，逻辑上视为已删。
+直接把记录从页里抹掉会破坏 `slot × (recordSize + 2)` 的偏移公式（后面的记录会错位）。本实现用最朴素的**墓碑（tombstone）**：不删记录字节，只把该槽的**标记字节**写成 `'-'`，物理上不删，逻辑上视为已删：
 
 ```c
 RC deleteRecord(RM_TableData *rel, RID id) {
-    int page_id = id.page, slot_id = id.slot;
+    int pageSize = PAGE_SIZE;
     int recordSize = getRecordSize(rel->schema);
+    int numSlots = getRecordsPerPage(rel->schema);
 
-    char *data = (char *) malloc(sizeof(char) * recordSize);
-    memset(data, '\0', sizeof(char) * recordSize);
-    data[0] = '-'; data[1] = 'D'; data[2] = '-';
+    BM_PageHandle pageHandle;
+    if (pinPage(rel->mgmtData, &pageHandle, id.page) != RC_OK)
+        return RC_RM_BUFFER_PIN_FAILED;
 
-    int offset = slot_id * recordSize + sizeof(int);
-    pinPage(pBuffP, pPageH, page_id);
-    memcpy((char *) pPageH->data + offset, data, recordSize);
-    markDirty(pBuffP, pPageH); unpinPage(pBuffP, pPageH);
-    forceFlushPool(pBuffP);
-    free(data);
+    int offset = id.slot * (recordSize + 2);
+    char marker = pageHandle.data[offset];
+    if (marker != '+') {                        // 槽本来就是空的/已删
+        unpinPage(rel->mgmtData, &pageHandle);  // 先释放 pin 再报错
+        return RC_RM_INVALID_RID;
+    }
 
-    numOfTuples--;
-    ((TableInfo *) rel->mgmtData)->numOfTuples--;
+    pageHandle.data[offset] = '-';              // 打墓碑
+    if (markDirty(rel->mgmtData, &pageHandle) != RC_OK)
+        return RC_RM_MARK_DIRTY_FAILED;
+    rel->numTuples--;                           // 内存里的元组数 -1
+    if (unpinPage(rel->mgmtData, &pageHandle) != RC_OK)
+        return RC_RM_BUFFER_UNPIN_FAILED;
     return RC_OK;
 }
 ```
 
-`getRecord` 读出后会检查头三字节是不是 `-D-`，是就返回 `RC_RM_NO_MORE_TUPLES`（墓碑标记）：
+`getRecord` 同样先看标记字节：不是 `'+'` 就返回 `RC_RM_INVALID_RID`（524），访问已删/空槽是非法操作：
 
 ```c
-if ('-' == record->data[0] && 'D' == record->data[1] && '-' == record->data[2])
-    return RC_RM_NO_MORE_TUPLES;
+char marker = pageHandle.data[offset];
+if (marker != '+') {
+    unpinPage(rel->mgmtData, &pageHandle);      // 先释放 pin 再报错
+    return RC_RM_INVALID_RID;
+}
 ```
 
-扫描时遇到墓碑就跳过。这是最简单的「软删除」——
+扫描（3.4.5）遇到 `'-'` 槽也直接跳过。这是最简单的「软删除」——
 
-- **优点**：实现极简，不影响 RID 寻址，`RID = (page, slot)` 在删除前后含义一致
-- **缺点**：空间不回收，反复增删会让文件越来越「虚」；后续若要复用空槽，还得额外维护一个空闲链表
+- **优点**：实现极简，不影响 RID 寻址，`RID = (page, slot)` 在删除前后含义一致；墓碑只占 1 个标记字节，几乎不浪费空间
+- **缺点**：空间不完全回收——文件不会自动缩小，被删空的数据页留在文件末尾；墓碑槽虽会被插入复用（见 3.4.3），但页内不会压缩，反复增删仍可能让文件「虚胖」
 
 **English**
 
-Directly erasing a record from a page would break the `slot × recordSize` offset formula (subsequent records would shift). This implementation uses the simplest form of **tombstone**: write `-D-` into the first three bytes of the record's data. Physically nothing is removed; logically the record is gone.
+Directly erasing a record from a page would break the `slot × (recordSize + 2)` offset formula (subsequent records would shift). This implementation uses the simplest form of **tombstone**: instead of removing the record bytes, it flips the slot's **marker byte** to `'-'`. Physically nothing is removed; logically the record is gone:
 
 ```c
 // (same code as above)
 ```
 
-After `getRecord` reads a record, it checks the first three bytes for `-D-`; if so, it returns `RC_RM_NO_MORE_TUPLES` (the tombstone marker):
+`getRecord` checks the marker byte first; anything other than `'+'` returns `RC_RM_INVALID_RID` (524) — reading a deleted or empty slot is an illegal operation:
 
 ```c
-if ('-' == record->data[0] && 'D' == record->data[1] && '-' == record->data[2])
-    return RC_RM_NO_MORE_TUPLES;
+// (same code as above)
 ```
 
-Scans skip tombstoned records. This is the simplest "soft delete":
+Scans (3.4.5) skip `'-'` slots too. This is the simplest "soft delete":
 
-- **Pro**: dead-simple, doesn't disturb RID addressing — `RID = (page, slot)` means the same thing before and after a delete.
-- **Con**: space is never reclaimed; repeated inserts/deletes leave the file increasingly "hollow". Reusing free slots later would require an additional free-list.
+- **Pro**: dead-simple, doesn't disturb RID addressing — `RID = (page, slot)` means the same thing before and after a delete; a tombstone costs only 1 marker byte.
+- **Con**: space is not fully reclaimed — the file never shrinks and emptied pages stay at the end; inserts land at the "count of occupied slots" index rather than actively reusing tombstone slots (see 3.4.3), so repeated insert/delete cycles can leave the file "bloated".
 
 ---
 
@@ -510,96 +482,126 @@ Scans skip tombstoned records. This is the simplest "soft delete":
 
 **中文**
 
-扫描 = 逐页逐槽遍历 + 条件过滤。`startScan` 把扫描状态（当前 page/slot + 条件表达式）装进 `Scanner`：
+扫描 = 逐页逐槽遍历 + 条件过滤。`startScan` 把扫描状态（当前 page/slot、条件表达式、**扫描开始时的表总页数**）装进 `RM_ScanInfo`：
 
 ```c
 RC startScan(RM_TableData *rel, RM_ScanHandle *scan, Expr *cond) {
-    if (!rel || !scan || !cond) return RC_NULL_POINTER;
+    RM_ScanInfo *scanInfo = (RM_ScanInfo *) malloc(sizeof(RM_ScanInfo));
+    if (scanInfo == NULL) return RC_RM_MEM_ALLOC_FAILED;
 
-    int numPages = 0;
-    pinPage(pBuffP, pPageH, 0);
-    memcpy(&numPages, pPageH->data + sizeof(int), sizeof(int)); // 数据页数
-    unpinPage(pBuffP, pPageH);
+    scanInfo->curPage = 1;            // 数据从 page 1 开始
+    scanInfo->curSlot = -1;
+    scanInfo->condition = cond;
 
-    Scanner *sc = (Scanner *) malloc(sizeof(Scanner));
-    sc->page = numPages;
-    sc->slot = 0;
-    sc->cond = cond;
+    // 关键：扫描一开始就把表的总页数固定下来，作为扫描上界
+    scanInfo->totalPages = getTotalNumPages((BM_BufferPool *) rel->mgmtData);
+
     scan->rel = rel;
-    scan->mgmtData = sc;
+    scan->mgmtData = scanInfo;
     return RC_OK;
 }
 ```
 
-`next` 推进扫描，每次返回一条匹配的记录。核心是用 `evalExpr`（在 `expr.c` 里实现）对每条记录求值条件表达式：
+`next` 推进扫描，每次返回一条匹配的记录。核心是先看槽标记、跳过空槽/墓碑，再用 `evalExpr`（在 `expr.c` 里实现）对命中的记录求值条件：
 
 ```c
 RC next(RM_ScanHandle *scan, Record *record) {
-    RM_TableData *rel = scan->rel;
-    Scanner *sc = (Scanner *) scan->mgmtData;
-    int page = sc->page, slot = sc->slot;
-    int recordSize = getRecordSize(rel->schema);
-    int pageNum = sc->page + 1;
-    RID rid;
+    RM_ScanInfo *scanInfo = (RM_ScanInfo *) scan->mgmtData;
+    int recordSize = getRecordSize(scan->rel->schema);
+    int numSlots = getRecordsPerPage(scan->rel->schema);
 
-    Record *tmpRecord = (Record *) malloc(sizeof(Record));
-    tmpRecord->data = (char *) malloc(sizeof(char) * recordSize);
-    Value *value;
     while (true) {
-        int offset = page * PAGE_SIZE + sizeof(int) + slot * recordSize;
-        if (offset > pageNum * PAGE_SIZE) {              // 越界 = 扫完
-            freeRecord(tmpRecord);
+        // 上界用扫描开始时的 totalPages。这里绝不能改成动态 getTotalNumPages()：
+        // pinPage 碰到不存在的页会 appendEmptyBlock 扩文件，动态上界会「追着」
+        // 不断变大的文件，永远扫不完。
+        if (scanInfo->curPage >= scanInfo->totalPages)
             return RC_RM_NO_MORE_TUPLES;
-        }
-        rid.page = page; rid.slot = slot;
-        getRecord(rel, rid, tmpRecord);                  // 取一条
-        evalExpr(tmpRecord, rel->schema, sc->cond, &value); // 求值条件
 
-        if (value->v.boolV) {                            // 命中
-            memcpy(record->data, tmpRecord->data, recordSize);
-            // 推进扫描游标 page/slot …
-            freeVal(value); break;
+        scanInfo->curSlot++;
+
+        if (scanInfo->curSlot >= numSlots) {   // 当前页扫完，进下一页
+            scanInfo->curPage++;
+            scanInfo->curSlot = 0;
+            continue;
         }
-        freeVal(value);
-        // 没命中，游标前进 …
+
+        BM_PageHandle pageHandle;
+        if (pinPage(scan->rel->mgmtData, &pageHandle, scanInfo->curPage) != RC_OK)
+            return RC_RM_BUFFER_PIN_FAILED;
+
+        int offset = scanInfo->curSlot * (recordSize + 2);
+        char marker = pageHandle.data[offset];
+        if (marker != '+') {                   // 空槽/墓碑，跳过
+            unpinPage(scan->rel->mgmtData, &pageHandle);
+            continue;
+        }
+
+        memcpy(record->data, pageHandle.data + offset + 1, recordSize);
+        record->id.page = scanInfo->curPage;
+        record->id.slot = scanInfo->curSlot;
+
+        if (scanInfo->condition == NULL) {     // 无条件扫描，直接返回
+            unpinPage(scan->rel->mgmtData, &pageHandle);
+            return RC_OK;
+        }
+
+        // 有条件：evalExpr 求值，命中才返回
+        Value *result = NULL;
+        if (evalExpr(record, scan->rel->schema, scanInfo->condition, &result) != RC_OK) {
+            unpinPage(scan->rel->mgmtData, &pageHandle);
+            return RC_RM_SCAN_CONDITION_EVAL_FAILED;
+        }
+        bool match = result->v.boolV;
+        freeVal(result);
+        unpinPage(scan->rel->mgmtData, &pageHandle);
+        if (match) return RC_OK;
     }
-    freeRecord(tmpRecord);
-    return RC_OK;
 }
 ```
 
-`closeScan` 释放 `Scanner`：
+`closeScan` 释放 `RM_ScanInfo`：
 
 ```c
 RC closeScan(RM_ScanHandle *scan) {
-    if (scan->mgmtData) free(scan->mgmtData);
+    free(scan->mgmtData);
+    scan->mgmtData = NULL;
     return RC_OK;
 }
 ```
 
-整个扫描的代价是 **O(表里所有记录)**——没有索引，纯线性。第 4 章会用 B+ 树把这点优化掉。
+几个要点：
+
+- **扫描上界是这道工序最容易踩的坑**：必须用 `startScan` 时固定的 `totalPages`。若改成每次 `next` 调动态 `getTotalNumPages()`，因为 `pinPage` 读不存在的页会扩文件，上界会跟着文件一起长大，扫描永远结束不了。
+- **每槽一次 pin/unpin**：扫描逐槽 pin 页面、看完就 unpin，逻辑简单但每次都有缓冲池开销；课程规模可接受，第 4 章用 B+ 树把「逐表扫」变成「走索引」。
+- **墓碑直接被跳过**：`'-'` 槽在标记检查这一层就被过滤，不会进入 `evalExpr`。
+- 整个扫描的代价是 **O(表里所有记录)**——没有索引，纯线性。
 
 **English**
 
-A scan = page-by-page, slot-by-slot traversal with condition filtering. `startScan` packages the scan state (current page/slot + condition expression) into a `Scanner`:
+A scan = page-by-page, slot-by-slot traversal with condition filtering. `startScan` packages the scan state (current page/slot, the condition expression, and the **table's total page count at scan start**) into an `RM_ScanInfo`:
 
 ```c
 // (same code as above)
 ```
 
-`next` advances the scan and returns one matching record per call. The core is `evalExpr` (implemented in `expr.c`) which evaluates the condition against each record:
+`next` advances the scan and returns one matching record per call. It first checks the slot marker (skipping empty and tombstone slots), then uses `evalExpr` (implemented in `expr.c`) to evaluate the condition on a live record:
 
 ```c
 // (same code as above)
 ```
 
-`closeScan` frees the `Scanner`:
+`closeScan` frees the `RM_ScanInfo`:
 
 ```c
 // (same code as above)
 ```
 
-The whole scan costs **O(all records in the table)** — no index, pure linear. Chapter 4 will optimize this away with a B+ tree.
+Key points:
+
+- **The scan bound is the easiest pitfall in this step**: it must be the `totalPages` captured at `startScan`. If you instead call the live `getTotalNumPages()` each iteration, the bound grows together with the file (because `pinPage` calls `appendEmptyBlock` for pages that do not exist yet) and the scan never terminates.
+- **One pin/unpin per slot**: the scan pins a page, reads a slot, unpins — simple but with buffer-pool overhead per slot; fine at course scale. Chapter 4 replaces "scan the whole table" with "walk the index".
+- **Tombstones are skipped early**: `'-'` slots are filtered at the marker check, so they never reach `evalExpr`.
+- The whole scan costs **O(all records in the table)** — no index, pure linear.
 
 ---
 
@@ -614,24 +616,23 @@ The whole scan costs **O(all records in the table)** — no index, pure linear. 
 | `closeTable(rel)` | 关闭 | free schema + shutdown buffer pool |
 | `deleteTable(name)` | 删除 | 直接 `destroyPageFile` |
 | `getNumTuples(rel)` | 元信息 | 返回表里当前 tuple 数 |
-| `insertRecord(rel, record)` | 插入 | 找末页/新页 → 写 → 回填 RID |
-| `deleteRecord(rel, id)` | 删除 | 写 `-D-` 墓碑 |
+| `insertRecord(rel, record)` | 插入 | 逐页找空 → 写 → 回填 RID |
+| `deleteRecord(rel, id)` | 删除 | 槽标记置 `'-'`（墓碑） |
 | `updateRecord(rel, record)` | 更新 | 用 RID 定位后整条覆盖 |
 | `getRecord(rel, id, record)` | 点查 | 按 `(page, slot)` 读一条 |
-| `startScan(rel, scan, cond)` | 开始扫描 | 初始化 `Scanner` |
-| `next(scan, record)` | 取下一条 | 逐页逐槽 + `evalExpr` 过滤 |
-| `closeScan(scan)` | 结束扫描 | 释放 `Scanner` |
+| `startScan(rel, scan, cond)` | 开始扫描 | 初始化 `RM_ScanInfo`（含固定的 `totalPages`） |
+| `next(scan, record)` | 取下一条 | 逐页逐槽 + 标记过滤 + `evalExpr` |
+| `closeScan(scan)` | 结束扫描 | 释放 `RM_ScanInfo` |
 | `getRecordSize(schema)` | 算大小 | 各列长度累加 |
 | `createSchema(...)` / `freeSchema` | Schema 生命周期 | — |
 | `createRecord(...)` / `freeRecord` | Record 生命周期 | — |
 | `getAttr` / `setAttr` | 属性读写 | 按 offset 取/写一列 |
 
-`openTable` 会根据数据页头和墓碑重新计算存活 tuple 数，因此关闭后重新打开仍能
-得到正确计数，而不必额外持久化一个可能与记录状态漂移的计数器。
+本实现把元组数 `numTuples` **直接持久化**到 page 0：`closeTable` 在关表前写回，
+`openTable` 读回并赋给 `rel->numTuples`，因此关闭后重新打开计数仍然正确。
 
-`-D-` 墓碑只是教学简化：它占用了用户数据的前三个字节，因此正常记录如果恰好
-以这三个字节开头，会被误判为已删除。生产级页布局应使用独立的 slot 状态位图或
-tuple header 标志。
+墓碑是槽头独立的标记字节（`'-'`），与记录数据分离，不会误判正常记录。生产级
+页布局通常会进一步用 slot 状态位图或 tuple header 标志来支持更多槽状态。
 
 ---
 
@@ -670,11 +671,11 @@ printf("tuples: %d\n", getNumTuples(&rel));           // 1
 
 ## 3.7 思考题
 
-1. **本实现的墓碑 `-D-` 写在记录头三个字节。如果某个属性列本身就是 `DT_STRING`，且某条正常记录前三个字节恰好等于 `-D-`，会发生什么误判？应该把墓碑放在哪里才能彻底避免这种冲突？** 提示：考虑给记录加一个独立的「有效/已删」标志位，而不是和数据区共用字节。
+1. **本实现的墓碑是槽头独立的标记字节 `'-'`，与记录数据分离，因此不会误判正常记录。但如果要支持更多槽状态（未用 / 占用 / 已删 / 已更新），1 个标记字节还够吗？槽状态应该怎么编码？** 提示：引入槽状态位图（free space bitmap）或给标记字节增加取值。
 
-2. **页满标记用 `numRecords = -1`，下次插入走新页。但被删记录留下的空槽永远不复用——文件会越长越「虚」。如果要支持空槽复用，文件头（page 0）或每个数据页头部还需要多存什么信息？** 提示：空闲槽链表 / free space bitmap。
+2. **`insertRecord` 现在插入时扫描页内第一个非 `'+'` 槽（复用墓碑/空槽）。如果表需要频繁的「删中插」，「每次插入都从槽 0 重新扫描」仍然是个代价。有什么办法避免重复扫描？** 提示：页内空闲槽链表，或页头记录一个「下一个可能空闲」的 free hint。
 
-3. **线性扫描里 `getRecord` 在遇到墓碑时返回 `RC_RM_NO_MORE_TUPLES`，但扫描器其实希望「跳过墓碑继续找」而不是「停止扫描」。这两者怎么协调？** 提示：仔细看 `next` 里的 `while(true)` 循环——它如何把「这是墓碑，下一条」和「真的扫完了」区分开。
+3. **线性扫描的上界是 `startScan` 时固定的 `totalPages`。如果把它改成 `next` 里每次调用 `getTotalNumPages()`，会发生什么？为什么？** 提示：`pinPage` 对不存在的页做了什么（第 2 章）。
 
 ---
 

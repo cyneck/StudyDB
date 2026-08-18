@@ -1,6 +1,6 @@
 # Chapter 3 · Record Manager
 
-> Source files: `record_mgr.c` / `record_mgr.h` / `record_mgr_ex.h` / `tables.h`
+> Source files: `record_mgr.c` / `record_mgr.h` / `tables.h`
 >
 > Chapter 1 abstracted disk into "a sequence of pages"; Chapter 2 caches pages in memory. But the user's view has no "pages" — they see "tables, rows, columns". The **Record Manager** is the translator above those two layers: it organizes fixed-length pages into "a set of records with a schema".
 
@@ -34,27 +34,31 @@ A table file on disk looks like this:
 └──────────┴──────────────┴──────────────┴─────┴──────────────┘
 ```
 
-- **page 0** stores Schema metadata: the serialized `Schema` + the current number of data pages `numPageOfTable`.
-- **page 1..N** are **data pages**. Each data page is laid out as:
+- **page 0** stores the schema metadata + the current tuple count `numTuples` (see 3.4.2).
+- **page 1..N** are **data pages**, each made of fixed-size slots:
 
 ```
-┌──────────────┬──────────┬──────────┬─────┬──────────┐
-│ numRecords  │ record 0 │ record 1 │ ... │ record K │
-│ (4 bytes)   │          │          │     │          │
-└──────────────┴──────────┴──────────┴─────┴──────────┘
-                  ↑ slot 0   ↑ slot 1        ↑ slot K
+┌─────────────┬─────────────┬─────────────┬─────┬─────────────┐
+│   slot 0    │   slot 1    │   slot 2    │ ... │   slot K    │
+├─────────────┴─────────────┴─────────────┴─────┴─────────────┤
+│ each slot = [ marker(1B) | record bytes(recordSize) ], total recordSize+2 bytes │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-`numRecords` both counts records in the page and acts as a "page full" marker — set to `-1` when the page is full, so the next insert goes straight to a new page.
+A slot's **marker byte** encodes its state:
 
-**A record** is a compact byte string: attributes are concatenated in Schema order and accessed by offset.
+- `'+'`: occupied — a live record lives here
+- `'-'`: tombstone — the record was deleted; bytes remain but it is logically gone (see 3.4.4)
+- `'\0'`: never used (new pages are zero-filled by `createPageFile`)
 
 **RID → byte offset formula**: given `RID = (page, slot)`, the record's in-page byte offset is
 
 ```
-offset = slot × recordSize + sizeof(int)
-                                ↑ skip numRecords header
+offset = slot × (recordSize + 2) + 1
+         ↑ skip the marker byte
 ```
+
+Every slot is a fixed `recordSize + 2` bytes (1 marker + fixed-length record), so deleting a record never resizes a slot and a RID always points at the same slot — the key trade-off of the marker + fixed-slot model.
 
 ---
 
@@ -81,25 +85,23 @@ typedef struct Schema {
 
 `Schema` is the "shape spec" of a table — you must build one before creating a table. `typeLength` only matters for `DT_STRING` (fixed-length strings); other types' sizes are determined by `dataTypes` — `DT_INT` is 4 bytes, `DT_FLOAT` is 4 bytes, `DT_BOOL` is 1 byte.
 
-Extension types (`record_mgr_ex.h`, **internal, not exposed to users**):
+Extension types (this implementation drops `record_mgr_ex.h` in favor of two simpler choices):
 
-```c
-typedef struct RM_PageSlot  { int page_id; int slot_id; } PageSlot;        // internal location
-typedef struct RM_TableInfo { int numOfTuples; } TableInfo;                // table-level metadata
-typedef struct RM_Scanner   { int page; int slot; Expr *cond; } Scanner;  // scan state
-```
+- The scan state is `RM_ScanInfo`, internal to `record_mgr.c`: it holds the current page/slot, the scan condition, and the table's **total page count at scan start** `totalPages` (used as the scan bound, see 3.4.5).
+- The tuple count lives directly on `RM_TableData` as `numTuples`, not inside `mgmtData`.
 
 `RM_TableData` is the user-facing table handle:
 
 ```c
 typedef struct RM_TableData {
-    char *name;
-    Schema *schema;
-    void *mgmtData;   // holds a TableInfo (how many tuples are in the table)
+    char *name;       // table name
+    Schema *schema;   // table schema
+    void *mgmtData;   // holds the buffer pool handle (BM_BufferPool*)
+    int numTuples;    // tuple count: persisted to page 0 by closeTable, restored by openTable
 } RM_TableData;
 ```
 
-`mgmtData` is `void*` for the same information-hiding reason as `SM_FileHandle.mgmtInfo` in Chapter 1 — upper layers see only table semantics, not the internal `TableInfo` struct.
+`mgmtData` is `void*` for the same information-hiding reason as `SM_FileHandle.mgmtInfo` in Chapter 1 — upper layers see only table semantics, not the internal buffer-pool structure.
 
 ---
 
@@ -124,52 +126,53 @@ int getRecordSize(Schema *schema) {
 }
 ```
 
-Note: strings are **fixed-length** (length given by `typeLength[i]`), not C-string-style variable-with-`\0`. This keeps every record the same length, so the Nth record's offset is simply `slot × recordSize`. This fixed-length-record trade-off is what makes slot-based addressing work.
+Note: strings are **fixed-length** (length given by `typeLength[i]`), not C-string-style variable-with-`\0`. This keeps every record the same length, so the Nth slot's offset is simply `slot × (recordSize + 2)` (the +2 being the slot's marker byte). This fixed-length-record + marker-slot trade-off is what makes slot-based addressing work.
 
 ---
 
-### 3.4.2 Schema persistence: saveTableSchema / readTableSchema
+### 3.4.2 Schema persistence: writeTableSchema / openTable
 
-When a table is closed and reopened, its Schema must be readable from disk. `saveTableSchema` serializes the Schema into page 0 (large schemas may spill onto page 1+, so `numPagesOfSchema` is also stored):
+When a table is closed and reopened, its Schema must be readable from disk. Our `writeTableSchema` serializes the Schema + tuple count into page 0 (large schemas may spill onto page 1+, so `numPagesOfSchema` is stored too). Note it writes **directly through the storage manager** (`writeBlock`) rather than through the buffer pool — at create time the table is not open, so no pool exists yet:
 
 ```c
-RC saveTableSchema(Schema *schema) {
-    int sizeSchema = sizeof(int) * (3 + schema->numAttr * 3 + schema->keySize)
-                   + sizeof(DataType) * schema->numAttr;
-    int attrNameOffset = sizeSchema;            // string area starts after metadata area
-    int offset = 0;
+static RC writeTableSchema(SM_FileHandle *fh, Schema *schema, int numTuples) {
     int i;
+
+    int sizeSchema = sizeof(int) * (4 + schema->numAttr * 3 + schema->keySize)
+                     + sizeof(DataType) * schema->numAttr;
     for (i = 0; i < schema->numAttr; i++)
         sizeSchema += strlen(schema->attrNames[i]) + 1;
 
     int numPagesOfSchema = (sizeSchema - 1) / PAGE_SIZE + 1;
-    char *buffer = (char *) malloc(PAGE_SIZE * numPagesOfSchema);
-    memset(buffer, '\0', PAGE_SIZE * numPagesOfSchema);
-    int numPageOfTable = 0;
+    char *buffer = (char *) calloc(numPagesOfSchema, PAGE_SIZE);
+    if (buffer == NULL) return RC_RM_MEM_ALLOC_FAILED;
 
-    MEMCPY_TO_OFFSET(&numPagesOfSchema, int);
-    MEMCPY_TO_OFFSET(&numPageOfTable, int);
-    MEMCPY_TO_OFFSET(&(schema->numAttr), int);
-    MEMCPY_TO_OFFSET(&(schema->keySize), int);
+    int attrNameOffset = sizeSchema;   // string area starts after the metadata area
+    int offset = 0;
+
+    memcpy(buffer + offset, &numPagesOfSchema, sizeof(int)); offset += sizeof(int);
+    memcpy(buffer + offset, &numTuples,         sizeof(int)); offset += sizeof(int);
+    memcpy(buffer + offset, &schema->numAttr,   sizeof(int)); offset += sizeof(int);
+    memcpy(buffer + offset, &schema->keySize,   sizeof(int)); offset += sizeof(int);
 
     for (i = 0; i < schema->numAttr; i++) {
-        int slen = strlen(schema->attrNames[i]) + 1;
-        MEMCPY_TO_OFFSET(&attrNameOffset, int);
-        MEMCPY_TO_OFFSET(&slen, int);
-        MEMCPY_TO_OFFSET(&(schema->dataTypes[i]), DataType);
-        MEMCPY_TO_OFFSET(&(schema->typeLength[i]), int);
-        memcpy(&(buffer[attrNameOffset]), schema->attrNames[i], slen);
-        attrNameOffset += slen;
+        int nameLen = strlen(schema->attrNames[i]) + 1;
+        memcpy(buffer + offset, &attrNameOffset, sizeof(int));    offset += sizeof(int);
+        memcpy(buffer + offset, &nameLen,        sizeof(int));    offset += sizeof(int);
+        memcpy(buffer + offset, &schema->dataTypes[i],  sizeof(DataType)); offset += sizeof(DataType);
+        memcpy(buffer + offset, &schema->typeLength[i], sizeof(int));       offset += sizeof(int);
+        memcpy(buffer + attrNameOffset, schema->attrNames[i], nameLen);
+        attrNameOffset += nameLen;
     }
-    for (i = 0; i < schema->keySize; i++)
-        MEMCPY_TO_OFFSET(&(schema->keyAttrs[i]), int);
+    for (i = 0; i < schema->keySize; i++) {
+        memcpy(buffer + offset, &schema->keyAttrs[i], sizeof(int)); offset += sizeof(int);
+    }
 
-    for (i = 0; i < numPagesOfSchema; i++) {
-        pinPage(pBuffP, pPageH, i);
-        memcpy(pPageH->data, &(buffer[i * PAGE_SIZE]), PAGE_SIZE);
-        markDirty(pBuffP, pPageH);
-        unpinPage(pBuffP, pPageH);
-    }
+    for (i = 0; i < numPagesOfSchema; i++)
+        if (writeBlock(i, fh, buffer + i * PAGE_SIZE) != RC_OK) {
+            free(buffer);
+            return RC_WRITE_FAILED;
+        }
     free(buffer);
     return RC_OK;
 }
@@ -178,208 +181,215 @@ RC saveTableSchema(Schema *schema) {
 Page 0 byte layout:
 
 ```
-┌──────────────┬──────────────┬─────────┬─────────┬───────────────┬─────────────┐
-│numPagesOfSchem│numPageOfTable│ numAttr │ keySize │ per-attr meta×N│ keyAttrs×K  │ ... │ attrNames area │
-│   (int)       │   (int)      │ (int)   │ (int)   │ offset,slen,  │  (int×K)    │     │ (concatenated) │
-│              │              │         │         │ dataType,typLen│            │     │              │
-└──────────────┴──────────────┴─────────┴─────────┴───────────────┴─────────────┘
+┌──────────────┬──────────┬─────────┬─────────┬───────────────┬─────────────┐
+│numPagesOfSche│ numTuples│ numAttr │ keySize │ per-attr meta×N│ keyAttrs×K  │ ... │ attrNames area │
+│   (int)      │  (int)   │ (int)   │ (int)   │ offset,slen,  │  (int×K)    │     │ (concatenated) │
+│              │          │         │         │ dataType,typLen│            │     │              │
+└──────────────┴──────────┴─────────┴─────────┴───────────────┴─────────────┘
 ```
 
-`MEMCPY_TO_OFFSET` is a macro in `record_mgr_ex.h`: it copies data into `buffer[offset]` and then advances `offset` by `sizeof(type)` — equivalent to "write + seek":
-
-```c
-#define MEMCPY_TO_OFFSET(__expression__, __type__)               \
-    memcpy(&(buffer[offset]), __expression__, sizeof(__type__)); \
-    offset += sizeof(__type__)
-```
-
-`readTableSchema` is the mirror operation: it first reads `numPagesOfSchema` from page 0, loads those pages into a buffer, then deserializes back into a `Schema*` in reverse order.
+`createTable` calls it (numTuples = 0) to write the schema into the fresh file. `openTable` is the mirror: it pins page 0, reads `numPagesOfSchema` and `numTuples`, loads those pages into a buffer, deserializes back into a `Schema*` (rebuilt via `createSchema`, with freshly malloc'd attribute-name strings), and stores `numTuples` into `rel->numTuples`. `closeTable` writes the in-memory `numTuples` back to page 0 `[4..7]` before shutting the pool down — so the count survives a close → reopen round trip.
 
 ---
 
 ### 3.4.3 Inserting a record: insertRecord
 
-`insertRecord` flow: **read `numPageOfTable` → find last page → check if full → write → update `numRecords` → backfill RID**.
+`insertRecord` flow: **walk pages from page 1 → find the first free slot → if there is one, insert → backfill RID**. No data-page count is kept on page 0 — `pinPage` auto-grows the file when asked for a page that does not exist yet (chapter 2), so the loop naturally opens a new page when it reaches the end of the table:
 
 ```c
 RC insertRecord(RM_TableData *rel, Record *record) {
-    int numPagesOfTable = 0;
-    pinPage(pBuffP, pPageH, 0);
-    memcpy(&numPagesOfTable, pPageH->data + sizeof(int), sizeof(int)); // read data-page count
-    unpinPage(pBuffP, pPageH);
+    int recordSize = getRecordSize(rel->schema);
+    int numSlots = getRecordsPerPage(rel->schema);
 
-    Schema *schema = rel->schema;
-    PageSlot pos;
-    int numRecordInPage = 0;
+    int curPageNum = 1;                 // data starts at page 1
+    bool foundPage = false;
 
-    if (0 == numPagesOfTable) {                                 // table has no data pages yet
-        numPagesOfTable++;
-        updateNumPageOfTable(numPagesOfTable);
-        numRecordInPage = 0;
-        pinPage(pBuffP, pPageH, 1);                            // initialize page 1
-        memcpy(pPageH->data, &numRecordInPage, sizeof(int));
-        markDirty(pBuffP, pPageH); unpinPage(pBuffP, pPageH);
-        forceFlushPool(pBuffP);
-        pos.page_id = numPagesOfTable; pos.slot_id = 0;
-    } else {                                                    // read last page's numRecords
-        int tmpNum = 0;
-        pinPage(pBuffP, pPageH, numPagesOfTable);
-        memcpy(&tmpNum, pPageH->data, sizeof(int));
-        unpinPage(pBuffP, pPageH);
-        pos.page_id = numPagesOfTable; pos.slot_id = tmpNum;
+    while (!foundPage) {
+        BM_PageHandle pageHandle;
+        if (pinPage(rel->mgmtData, &pageHandle, curPageNum) != RC_OK)
+            return RC_RM_BUFFER_PIN_FAILED;
 
-        if (tmpNum == -1) {                                     // last page is full, open a new one
-            numPagesOfTable++;
-            updateNumPageOfTable(numPagesOfTable);
-            numRecordInPage = 0;
-            pinPage(pBuffP, pPageH, numPagesOfTable);
-            memcpy(pPageH->data, &numRecordInPage, sizeof(int));
-            markDirty(pBuffP, pPageH); unpinPage(pBuffP, pPageH);
-            forceFlushPool(pBuffP);
-            pos.page_id = numPagesOfTable; pos.slot_id = 0;
+        // Find the first free slot (marker != '+': never-used '\0' or tombstone '-')
+        int slotNum = -1;
+        for (int i = 0; i < numSlots; i++) {
+            int offset = i * (recordSize + 2);
+            if (pageHandle.data[offset] != '+') { slotNum = i; break; }
         }
+
+        if (slotNum >= 0) {                                     // this page has room
+            int offset = slotNum * (recordSize + 2);
+            memcpy(pageHandle.data + offset + 1, record->data, recordSize);
+            pageHandle.data[offset] = '+';                      // mark the slot occupied
+            record->id.page = curPageNum;
+            record->id.slot = slotNum;
+
+            if (markDirty(rel->mgmtData, &pageHandle) != RC_OK)
+                return RC_RM_MARK_DIRTY_FAILED;
+            rel->numTuples++;                                   // bump the in-memory count
+            if (unpinPage(rel->mgmtData, &pageHandle) != RC_OK)
+                return RC_RM_BUFFER_UNPIN_FAILED;
+            return RC_OK;
+        }
+        unpinPage(rel->mgmtData, &pageHandle);                  // full; try the next page
+        curPageNum++;
     }
-
-    record->id.page = pos.page_id;
-    record->id.slot = pos.slot_id;
-
-    int recordSize = getRecordSize(schema);
-    int offset = pos.slot_id * recordSize + sizeof(int);        // skip numRecords header
-    pinPage(pBuffP, pPageH, numPagesOfTable);
-    memcpy((char *) pPageH->data + offset, record->data, recordSize);
-
-    numRecordInPage = pos.slot_id + 1;
-    if ((numRecordInPage + 1) * recordSize + sizeof(int) > PAGE_SIZE)
-        numRecordInPage = -1;                                   // mark -1 if writing this record fills the page
-    memcpy(pPageH->data, &numRecordInPage, sizeof(int));
-    markDirty(pBuffP, pPageH); unpinPage(pBuffP, pPageH);
-    forceFlushPool(pBuffP);
-
-    numOfTuples++;
-    ((TableInfo *) rel->mgmtData)->numOfTuples++;
     return RC_OK;
 }
 ```
 
 Key points:
 
-- **Full-page marker**: `numRecords = -1` means "this page is full, next insert goes to a new page" — avoids repeatedly scanning for free slots.
+- **Page-full check by finding a free slot**: each page's `numSlots` markers are scanned; the first one that is not `'+'` is a free slot. Costs O(slots per page), but it is simple and easy to follow.
+- **Insert position = first free slot**: the insert reuses the page's first free slot — whether a never-used `'\0'` slot or a tombstone `'-'` slot left by a delete. This never overwrites a live record and reclaims tombstone space (see the discussion in 3.4.4).
+- **On-demand file growth**: `pinPage` calls `appendEmptyBlock` when `curPageNum` is past the end of the file, so the loop is guaranteed to terminate without manually tracking a "number of data pages".
 - **RID is the return value**: on success, `record->id` is filled with `(page, slot)`, which the caller can pass to `getRecord` / `deleteRecord`.
-- **Page-full check by arithmetic**: because `recordSize` is constant, the simple check `(numRecordInPage + 1) * recordSize + sizeof(int) > PAGE_SIZE` is enough to tell whether the next record still fits.
-- **`markDirty` + `forceFlushPool`**: flush to disk immediately after each write for crash consistency — at the cost of performance (every insert triggers I/O).
+- **`markDirty` + `unpin`**: only marks the page dirty and releases the pin; the actual flush is left to the buffer pool (`forceFlushPool` at close), not per-insert.
 
 ---
 
 ### 3.4.4 Deletion and tombstones: deleteRecord
 
-Directly erasing a record from a page would break the `slot × recordSize` offset formula (subsequent records would shift). This implementation uses the simplest form of **tombstone**: write `-D-` into the first three bytes of the record's data. Physically nothing is removed; logically the record is gone.
+Directly erasing a record from a page would break the `slot × (recordSize + 2)` offset formula (subsequent records would shift). This implementation uses the simplest form of **tombstone**: instead of removing the record bytes, it flips the slot's **marker byte** to `'-'`. Physically nothing is removed; logically the record is gone:
 
 ```c
 RC deleteRecord(RM_TableData *rel, RID id) {
-    int page_id = id.page, slot_id = id.slot;
+    int pageSize = PAGE_SIZE;
     int recordSize = getRecordSize(rel->schema);
+    int numSlots = getRecordsPerPage(rel->schema);
 
-    char *data = (char *) malloc(sizeof(char) * recordSize);
-    memset(data, '\0', sizeof(char) * recordSize);
-    data[0] = '-'; data[1] = 'D'; data[2] = '-';
+    BM_PageHandle pageHandle;
+    if (pinPage(rel->mgmtData, &pageHandle, id.page) != RC_OK)
+        return RC_RM_BUFFER_PIN_FAILED;
 
-    int offset = slot_id * recordSize + sizeof(int);
-    pinPage(pBuffP, pPageH, page_id);
-    memcpy((char *) pPageH->data + offset, data, recordSize);
-    markDirty(pBuffP, pPageH); unpinPage(pBuffP, pPageH);
-    forceFlushPool(pBuffP);
-    free(data);
+    int offset = id.slot * (recordSize + 2);
+    char marker = pageHandle.data[offset];
+    if (marker != '+') {                        // slot already empty/deleted
+        unpinPage(rel->mgmtData, &pageHandle);  // release the pin before returning
+        return RC_RM_INVALID_RID;
+    }
 
-    numOfTuples--;
-    ((TableInfo *) rel->mgmtData)->numOfTuples--;
+    pageHandle.data[offset] = '-';              // stamp the tombstone
+    if (markDirty(rel->mgmtData, &pageHandle) != RC_OK)
+        return RC_RM_MARK_DIRTY_FAILED;
+    rel->numTuples--;                           // decrement the in-memory count
+    if (unpinPage(rel->mgmtData, &pageHandle) != RC_OK)
+        return RC_RM_BUFFER_UNPIN_FAILED;
     return RC_OK;
 }
 ```
 
-After `getRecord` reads a record, it checks the first three bytes for `-D-`; if so, it returns `RC_RM_NO_MORE_TUPLES` (the tombstone marker):
+`getRecord` checks the marker byte first; anything other than `'+'` returns `RC_RM_INVALID_RID` (524) — reading a deleted or empty slot is an illegal operation:
 
 ```c
-if ('-' == record->data[0] && 'D' == record->data[1] && '-' == record->data[2])
-    return RC_RM_NO_MORE_TUPLES;
+char marker = pageHandle.data[offset];
+if (marker != '+') {
+    unpinPage(rel->mgmtData, &pageHandle);      // release the pin before returning
+    return RC_RM_INVALID_RID;
+}
 ```
 
-Scans skip tombstoned records. This is the simplest "soft delete":
+Scans (3.4.5) skip `'-'` slots too. This is the simplest "soft delete":
 
-- **Pro**: dead-simple, doesn't disturb RID addressing — `RID = (page, slot)` means the same thing before and after a delete.
-- **Con**: space is never reclaimed; repeated inserts/deletes leave the file increasingly "hollow". Reusing free slots later would require an additional free-list.
+- **Pro**: dead-simple, doesn't disturb RID addressing — `RID = (page, slot)` means the same thing before and after a delete; a tombstone costs only 1 marker byte.
+- **Con**: space is not fully reclaimed — the file never shrinks and emptied pages stay at the end; tombstone slots are reused on insert (see 3.4.3) but pages are never compacted, so repeated insert/delete cycles can still leave the file "bloated".
 
 ---
 
 ### 3.4.5 Linear scan: startScan / next / closeScan
 
-A scan = page-by-page, slot-by-slot traversal with condition filtering. `startScan` packages the scan state (current page/slot + condition expression) into a `Scanner`:
+A scan = page-by-page, slot-by-slot traversal with condition filtering. `startScan` packages the scan state (current page/slot, the condition expression, and the **table's total page count at scan start**) into an `RM_ScanInfo`:
 
 ```c
 RC startScan(RM_TableData *rel, RM_ScanHandle *scan, Expr *cond) {
-    if (!rel || !scan || !cond) return RC_NULL_POINTER;
+    RM_ScanInfo *scanInfo = (RM_ScanInfo *) malloc(sizeof(RM_ScanInfo));
+    if (scanInfo == NULL) return RC_RM_MEM_ALLOC_FAILED;
 
-    int numPages = 0;
-    pinPage(pBuffP, pPageH, 0);
-    memcpy(&numPages, pPageH->data + sizeof(int), sizeof(int)); // data page count
-    unpinPage(pBuffP, pPageH);
+    scanInfo->curPage = 1;            // data starts at page 1
+    scanInfo->curSlot = -1;
+    scanInfo->condition = cond;
 
-    Scanner *sc = (Scanner *) malloc(sizeof(Scanner));
-    sc->page = numPages;
-    sc->slot = 0;
-    sc->cond = cond;
+    // Key: fix the table's total page count at scan start as the scan bound
+    scanInfo->totalPages = getTotalNumPages((BM_BufferPool *) rel->mgmtData);
+
     scan->rel = rel;
-    scan->mgmtData = sc;
+    scan->mgmtData = scanInfo;
     return RC_OK;
 }
 ```
 
-`next` advances the scan and returns one matching record per call. The core is `evalExpr` (implemented in `expr.c`) which evaluates the condition against each record:
+`next` advances the scan and returns one matching record per call. It first checks the slot marker (skipping empty and tombstone slots), then uses `evalExpr` (implemented in `expr.c`) to evaluate the condition on a live record:
 
 ```c
 RC next(RM_ScanHandle *scan, Record *record) {
-    RM_TableData *rel = scan->rel;
-    Scanner *sc = (Scanner *) scan->mgmtData;
-    int page = sc->page, slot = sc->slot;
-    int recordSize = getRecordSize(rel->schema);
-    int pageNum = sc->page + 1;
-    RID rid;
+    RM_ScanInfo *scanInfo = (RM_ScanInfo *) scan->mgmtData;
+    int recordSize = getRecordSize(scan->rel->schema);
+    int numSlots = getRecordsPerPage(scan->rel->schema);
 
-    Record *tmpRecord = (Record *) malloc(sizeof(Record));
-    tmpRecord->data = (char *) malloc(sizeof(char) * recordSize);
-    Value *value;
     while (true) {
-        int offset = page * PAGE_SIZE + sizeof(int) + slot * recordSize;
-        if (offset > pageNum * PAGE_SIZE) {              // out of bounds = scan done
-            freeRecord(tmpRecord);
+        // Bound by the totalPages captured at startScan. This must NOT be a live
+        // getTotalNumPages() call: pinPage grows the file for pages that do not
+        // exist yet, so a live bound would chase the growing file forever.
+        if (scanInfo->curPage >= scanInfo->totalPages)
             return RC_RM_NO_MORE_TUPLES;
-        }
-        rid.page = page; rid.slot = slot;
-        getRecord(rel, rid, tmpRecord);                  // fetch one record
-        evalExpr(tmpRecord, rel->schema, sc->cond, &value); // evaluate condition
 
-        if (value->v.boolV) {                            // hit
-            memcpy(record->data, tmpRecord->data, recordSize);
-            // advance scan cursor page/slot …
-            freeVal(value); break;
+        scanInfo->curSlot++;
+
+        if (scanInfo->curSlot >= numSlots) {   // current page done; next page
+            scanInfo->curPage++;
+            scanInfo->curSlot = 0;
+            continue;
         }
-        freeVal(value);
-        // no hit, advance cursor …
+
+        BM_PageHandle pageHandle;
+        if (pinPage(scan->rel->mgmtData, &pageHandle, scanInfo->curPage) != RC_OK)
+            return RC_RM_BUFFER_PIN_FAILED;
+
+        int offset = scanInfo->curSlot * (recordSize + 2);
+        char marker = pageHandle.data[offset];
+        if (marker != '+') {                   // empty/tombstone slot; skip
+            unpinPage(scan->rel->mgmtData, &pageHandle);
+            continue;
+        }
+
+        memcpy(record->data, pageHandle.data + offset + 1, recordSize);
+        record->id.page = scanInfo->curPage;
+        record->id.slot = scanInfo->curSlot;
+
+        if (scanInfo->condition == NULL) {     // no condition; return directly
+            unpinPage(scan->rel->mgmtData, &pageHandle);
+            return RC_OK;
+        }
+
+        // Evaluate the condition; return the record only if it matches
+        Value *result = NULL;
+        if (evalExpr(record, scan->rel->schema, scanInfo->condition, &result) != RC_OK) {
+            unpinPage(scan->rel->mgmtData, &pageHandle);
+            return RC_RM_SCAN_CONDITION_EVAL_FAILED;
+        }
+        bool match = result->v.boolV;
+        freeVal(result);
+        unpinPage(scan->rel->mgmtData, &pageHandle);
+        if (match) return RC_OK;
     }
-    freeRecord(tmpRecord);
-    return RC_OK;
 }
 ```
 
-`closeScan` frees the `Scanner`:
+`closeScan` frees the `RM_ScanInfo`:
 
 ```c
 RC closeScan(RM_ScanHandle *scan) {
-    if (scan->mgmtData) free(scan->mgmtData);
+    free(scan->mgmtData);
+    scan->mgmtData = NULL;
     return RC_OK;
 }
 ```
 
-The whole scan costs **O(all records in the table)** — no index, pure linear. Chapter 4 will optimize this away with a B+ tree.
+Key points:
+
+- **The scan bound is the easiest pitfall in this step**: it must be the `totalPages` captured at `startScan`. If you instead call the live `getTotalNumPages()` each iteration, the bound grows together with the file (because `pinPage` calls `appendEmptyBlock` for pages that do not exist yet) and the scan never terminates.
+- **One pin/unpin per slot**: the scan pins a page, reads a slot, unpins — simple but with buffer-pool overhead per slot; fine at course scale. Chapter 4 replaces "scan the whole table" with "walk the index".
+- **Tombstones are skipped early**: `'-'` slots are filtered at the marker check, so they never reach `evalExpr`.
+- The whole scan costs **O(all records in the table)** — no index, pure linear.
 
 ---
 
@@ -394,26 +404,25 @@ The whole scan costs **O(all records in the table)** — no index, pure linear. 
 | `closeTable(rel)` | Close | free schema + shutdown buffer pool |
 | `deleteTable(name)` | Delete | Directly `destroyPageFile` |
 | `getNumTuples(rel)` | Metadata | Return current tuple count |
-| `insertRecord(rel, record)` | Insert | Find last/new page → write → backfill RID |
-| `deleteRecord(rel, id)` | Delete | Write `-D-` tombstone |
+| `insertRecord(rel, record)` | Insert | Walk pages for room → write → backfill RID |
+| `deleteRecord(rel, id)` | Delete | Set slot marker to `'-'` (tombstone) |
 | `updateRecord(rel, record)` | Update | Locate by RID, overwrite the whole record |
 | `getRecord(rel, id, record)` | Point query | Read one record by `(page, slot)` |
-| `startScan(rel, scan, cond)` | Start scan | Initialize `Scanner` |
-| `next(scan, record)` | Next | Page-by-page + `evalExpr` filtering |
-| `closeScan(scan)` | End scan | Free `Scanner` |
+| `startScan(rel, scan, cond)` | Start scan | Initialize `RM_ScanInfo` (with a fixed `totalPages`) |
+| `next(scan, record)` | Next | Page-by-page + marker filtering + `evalExpr` |
+| `closeScan(scan)` | End scan | Free `RM_ScanInfo` |
 | `getRecordSize(schema)` | Size | Sum of column lengths |
 | `createSchema(...)` / `freeSchema` | Schema lifecycle | — |
 | `createRecord(...)` / `freeRecord` | Record lifecycle | — |
 | `getAttr` / `setAttr` | Attr read/write | Get/set one column by offset |
 
-`openTable` reconstructs the live tuple count from data-page headers and
-tombstones. The count therefore survives close/reopen without a second
-persisted counter that could drift from record state.
+This implementation persists `numTuples` **directly** on page 0: `closeTable`
+writes it back before shutting the pool down, and `openTable` reads it back into
+`rel->numTuples` — so the count survives a close/reopen round trip.
 
-The `-D-` tombstone is a teaching simplification: because it shares the first
-three bytes of user data, a valid record beginning with those bytes is
-indistinguishable from a deleted row. A production layout needs a separate
-slot-state bitmap or tuple-header flag.
+The tombstone is a marker byte (`'-'`) in the slot header, separate from record
+data, so valid records are never misjudged. A production layout would go further
+and use a slot-state bitmap or tuple-header flags to support more slot states.
 
 ---
 
@@ -452,11 +461,11 @@ printf("tuples: %d\n", getNumTuples(&rel));           // 1
 
 ## 3.7 Discussion questions
 
-1. **This implementation writes the tombstone `-D-` into the first three bytes of a record. If some attribute column is itself `DT_STRING`, and a normal record happens to have its first three bytes equal to `-D-`, what false positive would occur? Where should the tombstone be placed to fully avoid this conflict?** Hint: consider adding a separate "valid/deleted" flag bit to the record, rather than sharing bytes with the data area.
+1. **The tombstone in this implementation is a marker byte `'-'` in the slot header, separate from record data, so valid records are never misjudged. But if you needed more slot states (unused / occupied / deleted / updated), is 1 marker byte enough? How would you encode slot states?** Hint: a slot-state bitmap, or more values for the marker byte.
 
-2. **The page-full marker uses `numRecords = -1`, and the next insert goes to a new page. But the free slots left by deleted records are never reused — the file grows increasingly "hollow". If you wanted to support free-slot reuse, what extra information would the file header (page 0) or each data page header need to store?** Hint: free-slot list / free space bitmap.
+2. **`insertRecord` now scans the page for the first non-`'+'` slot (reusing tombstone/empty slots). For tables with frequent "delete-then-insert" patterns, "restarting the scan at slot 0 on every insert" is still a cost. How could you avoid rescanning?** Hint: an in-page free-slot list, or a "free hint" in the page header pointing at the next likely-free index.
 
-3. **In the linear scan, `getRecord` returns `RC_RM_NO_MORE_TUPLES` when it hits a tombstone — but the scanner actually wants to "skip the tombstone and keep looking", not "stop the scan". How do these two coordinate?** Hint: look carefully at the `while(true)` loop in `next` — how does it distinguish "this is a tombstone, on to the next" from "the scan is genuinely done"?
+3. **The linear scan's bound is the `totalPages` fixed at `startScan`. What would happen if you changed it to call `getTotalNumPages()` every iteration inside `next`? Why?** Hint: what does `pinPage` do for a page that does not exist yet (Chapter 2)?
 
 ---
 

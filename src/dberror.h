@@ -63,6 +63,22 @@ typedef int RC;
 #define RC_RM_INVALID_SCHEMA_DATA 506
 #define RC_RM_MANAGER_CLOSED 507
 
+// Return codes used by the storage/buffer/record manager implementation.
+// Values are chosen not to collide with the 500-507 / 105-111 ranges above.
+#define RC_BM_POOL_INIT_FAILED 400
+#define RC_BM_PINNED_PAGES_EXIST 401
+#define RC_BM_PAGE_NOT_FOUND 402
+#define RC_BM_BUFFER_POOL_FULL 403
+
+#define RC_RM_BUFFER_PIN_FAILED 520
+#define RC_RM_BUFFER_POOL_SHUTDOWN_FAILED 521
+#define RC_RM_MARK_DIRTY_FAILED 522
+#define RC_RM_BUFFER_UNPIN_FAILED 523
+#define RC_RM_INVALID_RID 524
+#define RC_RM_MEM_ALLOC_FAILED 525
+#define RC_RM_SCAN_CONDITION_EVAL_FAILED 526
+#define RC_RM_INVALID_ATTR_NUM 527
+
 #define RC_NO_REMOVABLE_PAGE 105
 #define RC_PAGELIST_NOT_INITIALIZED 106
 #define RC_PAGE_NOT_FOUND 107

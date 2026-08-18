@@ -22,7 +22,7 @@ a strict five-layer, one-way dependency stack.
 │ Layer 3 Record   │  Layer 4 B+ Tree Index   │  ← Table CRUD / Index lookup
 │  record_mgr.c    │   btree_mgr.c            │
 ├──────────────────┴──────────────────────────┤
-│  Layer 2  Buffer Manager  buffer_mgr.c       │  ← FIFO/LRU/simplified LRU_K
+│  Layer 2  Buffer Manager  buffer_mgr.c       │  ← FIFO/LRU (linked list + timestamps)
 ├─────────────────────────────────────────────┤
 │  Layer 1  Storage Manager  storage_mgr.c     │  ← page file I/O
 ├─────────────────────────────────────────────┤
@@ -92,10 +92,10 @@ from the same chapter are grouped together.
 | File | Role | Chapter |
 |------|------|---------|
 | `src/storage_mgr.c/h` | Page file read/write | Ch.1 |
-| `src/buffer_mgr.c/h` | Buffer pool + FIFO/LRU/simplified LRU_K | Ch.2 |
+| `src/buffer_mgr.c/h` | Buffer pool + FIFO/LRU replacement (linked list + timestamps) | Ch.2 |
 | `src/buffer_mgr_stat.c/h` | Buffer pool statistics | Ch.2 |
 | `src/record_mgr.c/h` | Table CRUD + linear scan | Ch.3 |
-| `src/record_mgr_ex.h` | Record manager internals (PageSlot/TableInfo/Scanner) | Ch.3 |
+| `src/record_mgr_ex.h` | Record manager internals (legacy, no longer built) | Ch.3 |
 | `src/expr.c/h` | Expression evaluation (WHERE condition tree) | Ch.3 |
 | `src/rm_serializer.c` | Record/Schema/Value serialization | Ch.3 |
 | `src/tables.h` | Core types (Value/RID/Record/Schema/RM_TableData) | Ch.3 |

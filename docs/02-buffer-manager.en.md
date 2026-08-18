@@ -42,6 +42,16 @@ A buffer pool is several pieces working together in memory:
 
 ## 2.3 Key data structures
 
+> **⚠️ Implementation-difference note (after the 2026-08 swap to the cs525-s23-11 implementation)**
+> The pinPage flow in 2.2, the data structures in 2.3, and the walkthrough in 2.5 all describe the **classic textbook design**: `BM_MgmtData` + hash table + free list + `isOpen`.
+> The **actual code** in `src/buffer_mgr.c` now uses a simpler design:
+> - a **doubly linked list of `BufferFrame`s** (each with dirty / fixCount / entryTimestamp / accessTimestamp), pointed to by `bm->mgmtData`;
+> - **linear list lookup**, no hash table (the pool is small, so a linear walk is simple and readable);
+> - only **FIFO (by entryTimestamp)** and **LRU (by accessTimestamp)** are implemented; other strategies return -1;
+> - `pinPage` grows the file on demand via `appendEmptyBlock` for pages that do not exist yet.
+>
+> The public API (§2.6) is unchanged, so upper layers call it the same way. The classic design below (hash table, load factor, LRU-K) is still worth reading as teaching material; to check the real code, see the file-header comment in `src/buffer_mgr.c`.
+
 The public handle `BM_BufferPool` exposes only interface-level fields; the real implementation hides inside `mgmtData`:
 
 ```c

@@ -1,0 +1,7 @@
+# Build artifacts
+build/
+*.o
+
+# Runtime artifacts (created by running demos/tests)
+catalog.bin
+

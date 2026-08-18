@@ -20,7 +20,7 @@
 │ 第3层 记录管理器  │  第4层 B+树索引          │  ← 表 CRUD / 索引查找
 │  record_mgr.c    │   btree_mgr.c            │
 ├──────────────────┴──────────────────────────┤
-│  第2层  缓冲池管理器  buffer_mgr.c          │  ← FIFO/LRU/简化 LRU_K
+│  第2层  缓冲池管理器  buffer_mgr.c          │  ← FIFO/LRU（链表+时间戳）
 ├─────────────────────────────────────────────┤
 │  第1层  存储管理器    storage_mgr.c         │  ← page file I/O
 ├─────────────────────────────────────────────┤
@@ -86,10 +86,10 @@ make clean && make all
 | 文件 | 角色 | 章节 |
 |------|------|------|
 | `src/storage_mgr.c/h` | page file 读写 | 第1章 |
-| `src/buffer_mgr.c/h` | 缓冲池 + FIFO/LRU/简化 LRU_K 替换策略 | 第2章 |
+| `src/buffer_mgr.c/h` | 缓冲池 + FIFO/LRU 替换策略（链表+时间戳） | 第2章 |
 | `src/buffer_mgr_stat.c/h` | 缓冲池统计信息 | 第2章 |
 | `src/record_mgr.c/h` | 表 CRUD + 线性扫描 | 第3章 |
-| `src/record_mgr_ex.h` | 记录管理器内部结构（PageSlot/TableInfo/Scanner） | 第3章 |
+| `src/record_mgr_ex.h` | 记录管理器内部结构（遗留，已不参与构建） | 第3章 |
 | `src/expr.c/h` | 表达式求值（WHERE 条件树） | 第3章 |
 | `src/rm_serializer.c` | 记录/Schema/Value 序列化打印 | 第3章 |
 | `src/tables.h` | 核心数据类型（Value/RID/Record/Schema/RM_TableData） | 第3章 |
