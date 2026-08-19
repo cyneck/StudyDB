@@ -105,6 +105,14 @@ void updateLRUTimestamps(BufferPool *bufferPool, const PageNumber pageNum)
 RC initBufferPool(BM_BufferPool *const bm, const char *const pageFileName,
                   const int numPages, ReplacementStrategy strategy, void *stratData)
 {
+    (void)stratData;
+    if (bm == NULL || pageFileName == NULL)
+        return RC_NULL_POINTER;
+    if (numPages <= 0)
+        return RC_INVALID_NUMPAGES;
+    if (strategy != RS_FIFO && strategy != RS_LRU)
+        return RC_BM_INVALID_STRATEGY;
+
     // Allocate memory for the buffer pool
     BufferPool *bufferPool = (BufferPool *)malloc(sizeof(BufferPool));
     if (bufferPool == NULL)
@@ -112,8 +120,15 @@ RC initBufferPool(BM_BufferPool *const bm, const char *const pageFileName,
 
     // Open the page file
     SM_FileHandle *fileHandle = (SM_FileHandle *)malloc(sizeof(SM_FileHandle));
-    if (openPageFile(pageFileName, fileHandle) != RC_OK)
+    if (fileHandle == NULL) {
+        free(bufferPool);
+        return RC_ALLOCATION_FAILED;
+    }
+    if (openPageFile(pageFileName, fileHandle) != RC_OK) {
+        free(fileHandle);
+        free(bufferPool);
         return RC_FILE_NOT_FOUND;
+    }
 
     // Set the buffer pool information
     bufferPool->fileHandle = fileHandle;
@@ -127,7 +142,14 @@ RC initBufferPool(BM_BufferPool *const bm, const char *const pageFileName,
     bufferPool->numWriteIO = 0;
 
     // Set the buffer pool in the BM_BufferPool structure
-    bm->pageFile = (char *)pageFileName;
+    bm->pageFile = (char *)malloc(strlen(pageFileName) + 1);
+    if (bm->pageFile == NULL) {
+        closePageFile(fileHandle);
+        free(fileHandle);
+        free(bufferPool);
+        return RC_ALLOCATION_FAILED;
+    }
+    strcpy(bm->pageFile, pageFileName);
     bm->numPages = numPages;
     bm->strategy = strategy;
     // Cast through void* so this compiles against headers where mgmtData
@@ -140,6 +162,8 @@ RC initBufferPool(BM_BufferPool *const bm, const char *const pageFileName,
 // Function to shutdown a buffer pool
 RC shutdownBufferPool(BM_BufferPool *const bm)
 {
+    if (bm == NULL || bm->mgmtData == NULL)
+        return RC_NULL_POINTER;
     // Get the buffer pool from the BM_BufferPool structure
     BufferPool *bufferPool = (BufferPool *)bm->mgmtData;
 
@@ -153,7 +177,9 @@ RC shutdownBufferPool(BM_BufferPool *const bm)
     }
 
     // Write all dirty pages to disk
-    forceFlushPool(bm);
+    RC rc = forceFlushPool(bm);
+    if (rc != RC_OK)
+        return rc;
 
     // Close the page file
     if (closePageFile(bufferPool->fileHandle) != RC_OK)
@@ -170,8 +196,11 @@ RC shutdownBufferPool(BM_BufferPool *const bm)
     }
 
     // Free memory allocated for buffer pool
-    free(bufferPool->fileHandle); //todo: why this line cause error?
+    free(bufferPool->fileHandle);
     free(bufferPool);
+    free(bm->pageFile);
+    bm->pageFile = NULL;
+    bm->mgmtData = NULL;
 
     return RC_OK;
 }
@@ -186,7 +215,7 @@ RC forceFlushPool(BM_BufferPool *const bm)
     BufferFrame *currentFrame = bufferPool->bufferFrames;
     while (currentFrame != NULL)
     {
-        if (currentFrame->dirty)
+        if (currentFrame->dirty && currentFrame->fixCount == 0)
         {
             if (writeBlock(currentFrame->pageHandle->pageNum, bufferPool->fileHandle,
                            currentFrame->pageHandle->data) != RC_OK)
@@ -234,6 +263,8 @@ RC unpinPage(BM_BufferPool *const bm, BM_PageHandle *const page)
     {
         if (currentFrame->pageHandle->pageNum == page->pageNum)
         {
+            if (currentFrame->fixCount <= 0)
+                return RC_BM_PAGE_NOT_BUFFERED;
             currentFrame->fixCount--;
 
             // If fix count becomes 0, update page position
@@ -284,6 +315,10 @@ RC forcePage(BM_BufferPool *const bm, BM_PageHandle *const page)
 // Function to pin a page
 RC pinPage(BM_BufferPool *const bm, BM_PageHandle *const page, const PageNumber pageNum)
 {
+    if (bm == NULL || bm->mgmtData == NULL || page == NULL)
+        return RC_NULL_POINTER;
+    if (pageNum < 0)
+        return RC_READ_NON_EXISTING_PAGE;
     // Get the buffer pool from the BM_BufferPool structure
     BufferPool *bufferPool = (BufferPool *)bm->mgmtData;
 
@@ -310,12 +345,20 @@ RC pinPage(BM_BufferPool *const bm, BM_PageHandle *const page, const PageNumber 
     {
         // Allocate memory for the page handle and page data
         BM_PageHandle *newPageHandle = (BM_PageHandle *)malloc(sizeof(BM_PageHandle));
+        if (newPageHandle == NULL)
+            return RC_ALLOCATION_FAILED;
         newPageHandle->data = (char *)calloc(PAGE_SIZE, sizeof(char));
+        if (newPageHandle->data == NULL) {
+            free(newPageHandle);
+            return RC_ALLOCATION_FAILED;
+        }
         newPageHandle->pageNum = pageNum;
 
-        if (pageNum >= bufferPool->fileHandle->totalNumPages)
-        {
-            appendEmptyBlock(bufferPool->fileHandle);
+        RC rc = ensureCapacity(pageNum + 1, bufferPool->fileHandle);
+        if (rc != RC_OK) {
+            free(newPageHandle->data);
+            free(newPageHandle);
+            return rc;
         }
 
         // Read the page from disk
@@ -328,6 +371,11 @@ RC pinPage(BM_BufferPool *const bm, BM_PageHandle *const page, const PageNumber 
         bufferPool->numReadIO++;
         // Create a new buffer frame
         BufferFrame *newFrame = (BufferFrame *)malloc(sizeof(BufferFrame));
+        if (newFrame == NULL) {
+            free(newPageHandle->data);
+            free(newPageHandle);
+            return RC_ALLOCATION_FAILED;
+        }
         newFrame->pageHandle = newPageHandle;
         newFrame->dirty = false;
         newFrame->fixCount = 1;
@@ -375,7 +423,7 @@ RC pinPage(BM_BufferPool *const bm, BM_PageHandle *const page, const PageNumber 
     }
     else
     {
-        return -1;
+        return RC_BM_INVALID_STRATEGY;
     }
 
     // If a page frame is found for replacement
@@ -398,10 +446,9 @@ RC pinPage(BM_BufferPool *const bm, BM_PageHandle *const page, const PageNumber 
                     bufferPool->numWriteIO++;
                 }
 
-                if (pageNum >= bufferPool->fileHandle->totalNumPages)
-                {
-                    appendEmptyBlock(bufferPool->fileHandle);
-                }
+                RC rc = ensureCapacity(pageNum + 1, bufferPool->fileHandle);
+                if (rc != RC_OK)
+                    return rc;
                 bufferPool->numReadIO++;
 
                 // Read the new page from disk

@@ -16,9 +16,9 @@
  *   hasIndex(int)
  *   indexNameLen(int) + indexName(bytes)
  *
- * File layout:
- *   Page 0:  [0..3] = entry count
- *   Page 1+: serialised entries, packed back-to-back, spilling across pages.
+ * File layout (packed across pages):
+ *   magic(int) + formatVersion(int) + entryCount(int) + entries...
+ * Deserialization validates every count, length, type, key index, and bound.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <string.h>
@@ -33,6 +33,35 @@
 static Catalog g_catalog;
 static SM_FileHandle g_catFH;
 static int g_initialized = 0;
+
+#define CATALOG_MAGIC 0x53444243 /* "SDBC" */
+#define CATALOG_VERSION 1
+#define CATALOG_MAX_ENTRIES 10000
+#define CATALOG_MAX_ATTRS 1024
+
+static int
+readIntChecked(const char *buf, int size, int *off, int *value)
+{
+    if (*off < 0 || *off > size - (int)sizeof(int)) return 0;
+    memcpy(value, buf + *off, sizeof(int));
+    *off += sizeof(int);
+    return 1;
+}
+
+static int
+readStringChecked(const char *buf, int size, int *off, char **value)
+{
+    int len;
+    if (!readIntChecked(buf, size, off, &len) || len < 0 || len > size - *off)
+        return 0;
+    char *s = (char *)malloc((size_t)len + 1);
+    if (s == NULL) return 0;
+    memcpy(s, buf + *off, len);
+    s[len] = '\0';
+    *off += len;
+    *value = s;
+    return 1;
+}
 
 /* ================================================================== */
 /*  Serialisation helpers                                            */
@@ -96,51 +125,87 @@ entrySerialize(char *buf, int *off, const CatalogEntry *e)
     }
 }
 
-/** Deserialise one entry from buf at *off; advance *off. Returns malloc'd entry. */
-static CatalogEntry *
-entryDeserialize(const char *buf, int *off)
+/** Deserialise one entry with bounds checking. */
+static RC
+entryDeserialize(const char *buf, int size, int *off, CatalogEntry **result)
 {
     CatalogEntry *e = (CatalogEntry *) calloc(1, sizeof(CatalogEntry));
-    int len;
-
-    memcpy(&len, buf + *off, sizeof(int)); *off += sizeof(int);
-    e->tableName = (char *) malloc(len + 1);
-    memcpy(e->tableName, buf + *off, len); e->tableName[len] = '\0'; *off += len;
+    if (e == NULL) return RC_ALLOCATION_FAILED;
+    if (!readStringChecked(buf, size, off, &e->tableName)) goto invalid;
 
     Schema *s = (Schema *) calloc(1, sizeof(Schema));
-    memcpy(&s->numAttr, buf + *off, sizeof(int)); *off += sizeof(int);
-    memcpy(&s->keySize, buf + *off, sizeof(int)); *off += sizeof(int);
-
-    s->attrNames  = (char **)     malloc(sizeof(char *) * s->numAttr);
-    s->dataTypes  = (DataType *)  malloc(sizeof(DataType) * s->numAttr);
-    s->typeLength = (int *)       malloc(sizeof(int) * s->numAttr);
-    s->keyAttrs   = (int *)       malloc(sizeof(int) * (s->keySize > 0 ? s->keySize : 1));
-
-    for (int i = 0; i < s->numAttr; i++) {
-        memcpy(&len, buf + *off, sizeof(int)); *off += sizeof(int);
-        s->attrNames[i] = (char *) malloc(len + 1);
-        memcpy(s->attrNames[i], buf + *off, len);
-        s->attrNames[i][len] = '\0'; *off += len;
-        memcpy(&s->dataTypes[i],  buf + *off, sizeof(int)); *off += sizeof(int);
-        memcpy(&s->typeLength[i], buf + *off, sizeof(int)); *off += sizeof(int);
+    if (s == NULL) goto allocation;
+    if (!readIntChecked(buf, size, off, &s->numAttr) ||
+        !readIntChecked(buf, size, off, &s->keySize) ||
+        s->numAttr <= 0 || s->numAttr > CATALOG_MAX_ATTRS ||
+        s->keySize < 0 || s->keySize > s->numAttr) {
+        free(s);
+        goto invalid;
     }
-    for (int i = 0; i < s->keySize; i++) {
-        memcpy(&s->keyAttrs[i], buf + *off, sizeof(int)); *off += sizeof(int);
+
+    s->attrNames  = (char **)calloc((size_t)s->numAttr, sizeof(char *));
+    s->dataTypes  = (DataType *)malloc(sizeof(DataType) * (size_t)s->numAttr);
+    s->typeLength = (int *)malloc(sizeof(int) * (size_t)s->numAttr);
+    s->keyAttrs   = (int *)malloc(sizeof(int) * (size_t)(s->keySize > 0 ? s->keySize : 1));
+    if (!s->attrNames || !s->dataTypes || !s->typeLength || !s->keyAttrs) {
+        e->schema = s;
+        goto allocation;
     }
     e->schema = s;
 
-    memcpy(&e->hasIndex, buf + *off, sizeof(int)); *off += sizeof(int);
-
-    memcpy(&len, buf + *off, sizeof(int)); *off += sizeof(int);
-    if (len > 0) {
-        e->indexName = (char *) malloc(len + 1);
-        memcpy(e->indexName, buf + *off, len); e->indexName[len] = '\0'; *off += len;
-    } else {
-        e->indexName = NULL;
+    for (int i = 0; i < s->numAttr; i++) {
+        int dt;
+        if (!readStringChecked(buf, size, off, &s->attrNames[i]) ||
+            !readIntChecked(buf, size, off, &dt) ||
+            !readIntChecked(buf, size, off, &s->typeLength[i]) ||
+            dt < DT_INT || dt > DT_BOOL || s->typeLength[i] < 0)
+            goto invalid;
+        s->dataTypes[i] = (DataType)dt;
     }
+    for (int i = 0; i < s->keySize; i++) {
+        if (!readIntChecked(buf, size, off, &s->keyAttrs[i]) ||
+            s->keyAttrs[i] < 0 || s->keyAttrs[i] >= s->numAttr)
+            goto invalid;
+    }
+    if (!readIntChecked(buf, size, off, &e->hasIndex) ||
+        (e->hasIndex != 0 && e->hasIndex != 1)) goto invalid;
+    if (!readStringChecked(buf, size, off, &e->indexName)) goto invalid;
+    if (!e->hasIndex && e->indexName[0] != '\0') goto invalid;
+    if (e->indexName[0] == '\0') { free(e->indexName); e->indexName = NULL; }
 
     e->next = NULL;
-    return e;
+    *result = e;
+    return RC_OK;
+
+allocation:
+    if (e->schema) {
+        if (e->schema->attrNames) {
+            for (int i = 0; i < e->schema->numAttr; i++) free(e->schema->attrNames[i]);
+        }
+        free(e->schema->attrNames);
+        free(e->schema->dataTypes);
+        free(e->schema->typeLength);
+        free(e->schema->keyAttrs);
+        free(e->schema);
+    }
+    free(e->tableName);
+    free(e);
+    return RC_ALLOCATION_FAILED;
+invalid:
+    if (e->schema) {
+        if (e->schema->attrNames) {
+            for (int i = 0; i < e->schema->numAttr; i++) free(e->schema->attrNames[i]);
+        }
+        free(e->schema->attrNames);
+        free(e->schema->dataTypes);
+        free(e->schema->typeLength);
+        free(e->schema->keyAttrs);
+        free(e->schema);
+    }
+    free(e->tableName);
+    free(e->indexName);
+    free(e);
+    return RC_RM_INVALID_SCHEMA_DATA;
 }
 
 /* ================================================================== */
@@ -151,7 +216,7 @@ static RC
 catalogFlush(void)
 {
     /* compute total size */
-    int total = sizeof(int);     /* count */
+    int total = sizeof(int) * 3; /* magic, version, count */
     CatalogEntry *e = g_catalog.head;
     while (e) {
         total += entrySize(e);
@@ -162,6 +227,9 @@ catalogFlush(void)
 
     char *buf = (char *) calloc(numPages, PAGE_SIZE);
     int off = 0;
+    int magic = CATALOG_MAGIC, version = CATALOG_VERSION;
+    memcpy(buf + off, &magic, sizeof(int)); off += sizeof(int);
+    memcpy(buf + off, &version, sizeof(int)); off += sizeof(int);
     memcpy(buf + off, &g_catalog.count, sizeof(int)); off += sizeof(int);
     e = g_catalog.head;
     while (e) {
@@ -170,10 +238,12 @@ catalogFlush(void)
     }
 
     /* ensure file has enough pages */
-    ensureCapacity(numPages, &g_catFH);
+    RC rc = ensureCapacity(numPages, &g_catFH);
+    if (rc != RC_OK) { free(buf); return rc; }
     g_catFH.curPagePos = 0;
     for (int i = 0; i < numPages; i++) {
-        writeBlock(i, &g_catFH, buf + i * PAGE_SIZE);
+        rc = writeBlock(i, &g_catFH, buf + i * PAGE_SIZE);
+        if (rc != RC_OK) { free(buf); return rc; }
     }
     free(buf);
     return RC_OK;
@@ -198,22 +268,54 @@ initCatalog(void)
         CHECKEX(createPageFile(g_catalog.pageFile));
         CHECKEX(openPageFile(g_catalog.pageFile, &g_catFH));
         g_initialized = 1;
-        catalogFlush();      /* write count=0 */
-        return RC_OK;
+        return catalogFlush();      /* write empty validated header */
     }
 
     /* load entries from disk */
-    char *buf = (char *) malloc(g_catFH.totalNumPages * PAGE_SIZE);
+    int totalBytes = g_catFH.totalNumPages * PAGE_SIZE;
+    if (totalBytes < (int)(sizeof(int) * 3)) {
+        closePageFile(&g_catFH);
+        free(g_catalog.pageFile);
+        return RC_RM_INVALID_SCHEMA_DATA;
+    }
+    char *buf = (char *) malloc((size_t)totalBytes);
+    if (buf == NULL) return RC_ALLOCATION_FAILED;
     for (int i = 0; i < g_catFH.totalNumPages; i++) {
-        readBlock(i, &g_catFH, buf + i * PAGE_SIZE);
+        RC rc = readBlock(i, &g_catFH, buf + i * PAGE_SIZE);
+        if (rc != RC_OK) { free(buf); return rc; }
     }
 
     int off = 0;
-    memcpy(&g_catalog.count, buf + off, sizeof(int)); off += sizeof(int);
+    int magic, version;
+    if (!readIntChecked(buf, totalBytes, &off, &magic) ||
+        !readIntChecked(buf, totalBytes, &off, &version) ||
+        !readIntChecked(buf, totalBytes, &off, &g_catalog.count) ||
+        magic != CATALOG_MAGIC || version != CATALOG_VERSION ||
+        g_catalog.count < 0 || g_catalog.count > CATALOG_MAX_ENTRIES) {
+        free(buf);
+        closePageFile(&g_catFH);
+        free(g_catalog.pageFile);
+        return RC_RM_INVALID_SCHEMA_DATA;
+    }
 
     CatalogEntry *tail = NULL;
     for (int i = 0; i < g_catalog.count; i++) {
-        CatalogEntry *e = entryDeserialize(buf, &off);
+        CatalogEntry *e = NULL;
+        RC rc = entryDeserialize(buf, totalBytes, &off, &e);
+        if (rc != RC_OK) {
+            free(buf);
+            while (g_catalog.head) {
+                CatalogEntry *next = g_catalog.head->next;
+                free(g_catalog.head->tableName);
+                freeSchema(g_catalog.head->schema);
+                free(g_catalog.head->indexName);
+                free(g_catalog.head);
+                g_catalog.head = next;
+            }
+            closePageFile(&g_catFH);
+            free(g_catalog.pageFile);
+            return rc;
+        }
         if (tail == NULL) g_catalog.head = e;
         else tail->next = e;
         tail = e;
@@ -255,7 +357,10 @@ RC
 catalogRegisterTable(const char *tableName, Schema *schema,
                      int hasIndex, const char *indexName)
 {
-    if (!g_initialized) return RC_RM_MANAGER_CLOSED;
+    if (!g_initialized) {
+        RC rc = initCatalog();
+        if (rc != RC_OK) return rc;
+    }
 
     /* duplicate check */
     if (catalogLookupTable(tableName) != NULL)
@@ -291,26 +396,45 @@ catalogRegisterTable(const char *tableName, Schema *schema,
         t->next = e;
     }
     g_catalog.count++;
-    catalogFlush();
-    return RC_OK;
+    RC rc = catalogFlush();
+    if (rc != RC_OK) {
+        /* Roll back the in-memory append if persistence failed. */
+        CatalogEntry *prev = NULL, *cur = g_catalog.head;
+        while (cur && cur != e) { prev = cur; cur = cur->next; }
+        if (prev) prev->next = NULL; else g_catalog.head = NULL;
+        g_catalog.count--;
+        free(e->tableName);
+        freeSchema(e->schema);
+        free(e->indexName);
+        free(e);
+    }
+    return rc;
 }
 
 RC
 catalogDropTable(const char *tableName)
 {
-    if (!g_initialized) return RC_RM_MANAGER_CLOSED;
+    if (!g_initialized) {
+        RC rc = initCatalog();
+        if (rc != RC_OK) return rc;
+    }
 
     CatalogEntry *prev = NULL, *cur = g_catalog.head;
     while (cur) {
         if (strcmp(cur->tableName, tableName) == 0) {
             if (prev) prev->next = cur->next;
             else g_catalog.head = cur->next;
+            g_catalog.count--;
+            RC rc = catalogFlush();
+            if (rc != RC_OK) {
+                if (prev) prev->next = cur; else g_catalog.head = cur;
+                g_catalog.count++;
+                return rc;
+            }
             free(cur->tableName);
             if (cur->schema) freeSchema(cur->schema);
             if (cur->indexName) free(cur->indexName);
             free(cur);
-            g_catalog.count--;
-            catalogFlush();
             return RC_OK;
         }
         prev = cur;

@@ -13,7 +13,7 @@ Across the previous eight chapters our small engine implemented:
 | Layer | Component | Problem solved |
 |-------|-----------|----------------|
 | Storage | `storage_mgr` | page file I/O |
-| Buffer | `buffer_mgr` | FIFO / LRU / LRU-K replacement |
+| Buffer | `buffer_mgr` | FIFO / LRU replacement |
 | Records | `record_mgr` | tables / records / scans |
 | Index | `btree_mgr` | B+ tree point & range lookup |
 | DDL | `ddl_parser` | CREATE / DROP TABLE |
@@ -152,7 +152,7 @@ PostgreSQL's answer is **WAL (Write-Ahead Log)**: every modification is written 
 
 Recovery then just replays the WAL: starting from the last checkpoint's position, reapply every "committed but not-yet-flushed" modification. Commit also gets faster — you only need to `fsync` the WAL file (small, sequential) instead of fsyncing every data page (large, random).
 
-Our small engine has no WAL — kill the process and everything is gone. This is exactly why our `demo` "loses" its data as soon as the process exits.
+Our engine flushes dirty pages during a normal close; the demo removes its data because it explicitly runs `DROP TABLE`. Without WAL, a crash during a multi-step change cannot be rolled back or replayed, so transactional durability is not guaranteed.
 
 ---
 

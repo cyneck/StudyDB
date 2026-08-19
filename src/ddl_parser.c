@@ -428,6 +428,12 @@ executeDDL(const char *sql)
 
     switch (st->type) {
         case DDL_CREATE_TABLE: {
+            rc = initCatalog();
+            if (rc != RC_OK) break;
+            if (catalogLookupTable(st->tableName) != NULL) {
+                rc = RC_RM_TABLE_EXISTS;
+                break;
+            }
             rc = createTable(st->tableName, st->schema);
             if (rc != RC_OK) break;
 
@@ -439,22 +445,39 @@ executeDDL(const char *sql)
                 snprintf(idxName, sizeof(idxName), "%s.idx", st->tableName);
                 DataType kt = st->schema->dataTypes[st->primaryKeyAttr];
                 rc = createBTree(idxName, kt, 0);
-                if (rc != RC_OK) break;
+                if (rc != RC_OK) {
+                    deleteTable(st->tableName);
+                    break;
+                }
                 hasIdx = 1;
             }
-            /* register in catalog (best-effort: if catalog is not
-             * initialised, the call is silently ignored) */
-            catalogRegisterTable(st->tableName, st->schema, hasIdx,
-                                 hasIdx ? idxName : NULL);
+            rc = catalogRegisterTable(st->tableName, st->schema, hasIdx,
+                                      hasIdx ? idxName : NULL);
+            if (rc != RC_OK) {
+                if (hasIdx) deleteBTree(idxName);
+                deleteTable(st->tableName);
+            }
             break;
         }
         case DDL_DROP_TABLE: {
-            rc = deleteTable(st->tableName);
-            /* best-effort delete of any associated index file */
+            rc = initCatalog();
+            if (rc != RC_OK) break;
+            CatalogEntry *entry = catalogLookupTable(st->tableName);
+            if (entry == NULL) {
+                rc = RC_IM_KEY_NOT_FOUND;
+                break;
+            }
             char idxName[256];
-            snprintf(idxName, sizeof(idxName), "%s.idx", st->tableName);
-            deleteBTree(idxName);
-            catalogDropTable(st->tableName);
+            idxName[0] = '\0';
+            if (entry->hasIndex && entry->indexName)
+                snprintf(idxName, sizeof(idxName), "%s", entry->indexName);
+            rc = deleteTable(st->tableName);
+            if (rc != RC_OK) break;
+            if (idxName[0] != '\0') {
+                rc = deleteBTree(idxName);
+                if (rc != RC_OK) break;
+            }
+            rc = catalogDropTable(st->tableName);
             break;
         }
         default:

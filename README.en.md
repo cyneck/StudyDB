@@ -61,6 +61,9 @@ explained in its chapter.
 # Build all targets
 make clean && make all
 
+# Run the complete automated suite
+make test
+
 # Original regression tests (9 cases, includes 10000-row insert)
 ./build/test_assign3_1
 
@@ -70,7 +73,7 @@ make clean && make all
 # DDL parser unit tests (5 cases)
 ./build/test_ddl
 
-# DML + Catalog unit tests (6 cases)
+# DML + Catalog tests, including duplicate-key consistency
 ./build/test_dml
 
 # C API end-to-end demo: DDL → insert → index lookup → range scan
@@ -113,9 +116,10 @@ from the same chapter are grouped together.
 |------|------|---------|
 | `src/test_assign3_1.c` | Original course regression test (9 cases) | Ch.3 |
 | `src/test_expr.c` | Expression evaluation test | Ch.3 |
+| `src/test_storage_buffer.c` | Storage bounds, sparse growth, and pin lifecycle | Ch.1-2 |
 | `src/test_btree.c` | B+ tree unit test (6 cases) | Ch.4 |
 | `src/test_ddl.c` | DDL parser unit test (5 cases) | Ch.5 |
-| `src/test_dml.c` | DML + Catalog unit test (6 cases) | Ch.7-8 |
+| `src/test_dml.c` | DML + Catalog and table/index consistency | Ch.7-8 |
 
 ### Infrastructure
 
@@ -130,7 +134,7 @@ from the same chapter are grouped together.
 
 ## Tech Stack
 
-- **Language**: C99 (`-std=c99 -g -Wall`)
+- **Language**: C99 (`-std=c99 -g -Wall -Wextra -Werror`)
 - **Dependencies**: libc only (`stdio/stdlib/string/math`), no third-party libs
 - **Platform**: Linux / macOS / WSL / MinGW
 - **Build**: GNU Make
@@ -139,4 +143,4 @@ from the same chapter are grouped together.
 
 ## License
 
-Educational use, feel free to learn from it.
+Released under the [MIT License](LICENSE).

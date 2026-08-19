@@ -9,7 +9,8 @@
  * out what columns `users` has and whether it has an index.
  *
  * Persistence: the catalog is stored in its own page file ("catalog.bin").
- * Page 0 holds the entry count; subsequent pages hold serialised entries.
+ * The file starts with a magic value, format version, and entry count;
+ * serialised entries follow and may span page boundaries.
  * On init the file is loaded into an in-memory linked list; on shutdown
  * (or register/drop) the list is flushed back to disk.
  *
@@ -54,7 +55,7 @@ extern RC catalogDropTable(const char *tableName);
 /* lookup */
 extern CatalogEntry *catalogLookupTable(const char *tableName);
 
-/* list all table names (caller does NOT free) */
+/* list all table names (caller frees every name and the returned array) */
 extern RC catalogListTables(char ***names, int *count);
 
 /* for debugging */

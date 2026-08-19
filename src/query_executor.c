@@ -143,6 +143,9 @@ execInsert(DML_Statement *stmt, CatalogEntry *entry)
 {
     RM_TableData tbl;
     CHECKEX(openTable(&tbl, entry->tableName));
+    BTreeHandle *idx = NULL;
+    Value *kv = NULL;
+    RC rc;
 
     Schema *sch = tbl.schema;
     if (stmt->numValues != sch->numAttr) {
@@ -158,26 +161,54 @@ execInsert(DML_Statement *stmt, CatalogEntry *entry)
         CHECKEX(setAttr(r, sch, i, stmt->values[i]));
     }
 
-    /* insert into table */
-    CHECKEX(insertRecord(&tbl, r));
-
-    /* maintain index if present */
+    /* Open and validate the unique primary-key index before changing the table. */
     if (entry->hasIndex && entry->indexName) {
-        BTreeHandle *idx = NULL;
-        if (openBTree(&idx, entry->indexName) == RC_OK) {
-            /* the indexed key is the primary key attribute */
-            int keyAttr = sch->keyAttrs[0];
-            Value *kv;
-            CHECKEX(getAttr(r, sch, keyAttr, &kv));
-            insertKey(idx, kv, r->id);
+        rc = openBTree(&idx, entry->indexName);
+        if (rc != RC_OK) {
+            freeRecord(r);
+            closeTable(&tbl);
+            return rc;
+        }
+        int keyAttr = sch->keyAttrs[0];
+        rc = getAttr(r, sch, keyAttr, &kv);
+        if (rc != RC_OK) {
+            closeBTree(&idx);
+            freeRecord(r);
+            closeTable(&tbl);
+            return rc;
+        }
+        RID existing;
+        if (findKey(idx, kv, &existing) == RC_OK) {
             freeVal(kv);
             closeBTree(&idx);
+            freeRecord(r);
+            closeTable(&tbl);
+            return RC_IM_KEY_ALREADY_EXISTS;
         }
     }
 
+    rc = insertRecord(&tbl, r);
+    if (rc != RC_OK) goto cleanup;
+
+    if (idx != NULL) {
+        rc = insertKey(idx, kv, r->id);
+        if (rc != RC_OK) {
+            /* No transaction manager exists, so compensate explicitly. */
+            deleteRecord(&tbl, r->id);
+            goto cleanup;
+        }
+    }
+
+cleanup:
+    if (kv) freeVal(kv);
+    if (idx) {
+        RC closeRc = closeBTree(&idx);
+        if (rc == RC_OK) rc = closeRc;
+    }
     freeRecord(r);
-    closeTable(&tbl);
-    return RC_OK;
+    RC closeRc = closeTable(&tbl);
+    if (rc == RC_OK) rc = closeRc;
+    return rc;
 }
 
 /* ================================================================== */
@@ -261,11 +292,24 @@ execDelete(DML_Statement *stmt, CatalogEntry *entry)
             BTreeHandle *idx = NULL;
             if (openBTree(&idx, entry->indexName) == RC_OK) {
                 int keyAttr = tbl.schema->keyAttrs[0];
-                Value *kv;
-                getAttr(r, tbl.schema, keyAttr, &kv);
-                deleteKey(idx, kv);
-                freeVal(kv);
-                closeBTree(&idx);
+                Value *kv = NULL;
+                RC indexRc = getAttr(r, tbl.schema, keyAttr, &kv);
+                if (indexRc == RC_OK)
+                    indexRc = deleteKey(idx, kv);
+                if (kv) freeVal(kv);
+                RC closeRc = closeBTree(&idx);
+                if (indexRc == RC_OK) indexRc = closeRc;
+                if (indexRc != RC_OK) {
+                    freeRecord(r);
+                    closeScan(&sc);
+                    closeTable(&tbl);
+                    return indexRc;
+                }
+            } else {
+                freeRecord(r);
+                closeScan(&sc);
+                closeTable(&tbl);
+                return RC_FILE_NOT_FOUND;
             }
         }
         CHECKEX(deleteRecord(&tbl, rid));

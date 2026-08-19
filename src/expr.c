@@ -56,6 +56,7 @@ valueSmaller (Value *left, Value *right, Value *result)
 		break;
 	case DT_BOOL:
 		result->v.boolV = (left->v.boolV < right->v.boolV);
+		break;
 	case DT_STRING:
 		result->v.boolV = (strcmp(left->v.stringV, right->v.stringV) < 0);
 		break;

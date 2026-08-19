@@ -56,6 +56,9 @@
 # 编译所有目标
 make clean && make all
 
+# 运行全部自动化测试
+make test
+
 # 跑原有回归测试（9 用例，含 10000 条插入）
 ./build/test_assign3_1
 
@@ -65,7 +68,7 @@ make clean && make all
 # 跑 DDL 解析单元测试（5 用例）
 ./build/test_ddl
 
-# 跑 DML + Catalog 单元测试（6 用例）
+# 跑 DML + Catalog 单元测试（含重复主键一致性检查）
 ./build/test_dml
 
 # 跑 C API 端到端示例：DDL 建表 → 插记录 → 索引查找 → 范围扫描
@@ -107,9 +110,10 @@ make clean && make all
 |------|------|----------|
 | `src/test_assign3_1.c` | 课程原始回归测试（9 用例，含 10000 条插入） | 第3章 |
 | `src/test_expr.c` | 表达式求值测试 | 第3章 |
+| `src/test_storage_buffer.c` | 存储边界、稀疏扩容、pin/unpin 测试 | 第1-2章 |
 | `src/test_btree.c` | B+ 树单元测试（6 用例） | 第4章 |
 | `src/test_ddl.c` | DDL 解析单元测试（5 用例） | 第5章 |
-| `src/test_dml.c` | DML + Catalog 单元测试（6 用例） | 第7-8章 |
+| `src/test_dml.c` | DML + Catalog 与表/索引一致性测试 | 第7-8章 |
 
 ### 基础设施
 
@@ -124,7 +128,7 @@ make clean && make all
 
 ## 技术栈 / Tech Stack
 
-- **语言**：C99（`-std=c99 -g -Wall`）
+- **语言**：C99（`-std=c99 -g -Wall -Wextra -Werror`）
 - **依赖**：仅 libc（`stdio/stdlib/string/math`），无第三方库
 - **平台**：Linux / macOS / WSL / MinGW
 - **构建**：GNU Make
@@ -133,4 +137,4 @@ make clean && make all
 
 ## 许可 / License
 
-教育用途，自由使用。Educational use, feel free to learn from it.
+本项目采用 [MIT License](LICENSE)，可用于学习、修改和分发。

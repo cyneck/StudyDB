@@ -26,10 +26,10 @@ typedef char* SM_PageHandle;
  ************************************************************/
 /* manipulating page files */
 extern void initStorageManager (void);
-extern RC createPageFile (char *fileName);
-extern RC openPageFile (char *fileName, SM_FileHandle *fHandle);
+extern RC createPageFile (const char *fileName);
+extern RC openPageFile (const char *fileName, SM_FileHandle *fHandle);
 extern RC closePageFile (SM_FileHandle *fHandle);
-extern RC destroyPageFile (char *fileName);
+extern RC destroyPageFile (const char *fileName);
 
 /* reading blocks from disc */
 extern RC readBlock (int pageNum, SM_FileHandle *fHandle, SM_PageHandle memPage);

@@ -15,7 +15,7 @@
 | 层次 | 我们实现的组件 | 解决的问题 |
 |------|---------------|----------|
 | 存储 | `storage_mgr` | page file 读写 |
-| 缓冲 | `buffer_mgr` | FIFO / LRU / LRU-K 替换 |
+| 缓冲 | `buffer_mgr` | FIFO / LRU 替换 |
 | 记录 | `record_mgr` | 表 / 记录 / 扫描 |
 | 索引 | `btree_mgr` | B+ 树点查与范围扫描 |
 | DDL | `ddl_parser` | CREATE / DROP TABLE |
@@ -39,7 +39,7 @@ Across the previous eight chapters our small engine implemented:
 | Layer | Component | Problem solved |
 |-------|-----------|----------------|
 | Storage | `storage_mgr` | page file I/O |
-| Buffer | `buffer_mgr` | FIFO / LRU / LRU-K replacement |
+| Buffer | `buffer_mgr` | FIFO / LRU replacement |
 | Records | `record_mgr` | tables / records / scans |
 | Index | `btree_mgr` | B+ tree point & range lookup |
 | DDL | `ddl_parser` | CREATE / DROP TABLE |
@@ -290,7 +290,7 @@ PostgreSQL 的解法是 **WAL（Write-Ahead Log）**：所有修改在写到数�
 
 这样恢复时只需重放 WAL：从最后一次 checkpoint 的位置开始，把日志里所有"已提交但未刷盘"的修改重新应用一遍。事务提交也变快了——只需 `fsync` WAL 文件（小、顺序写），不用 fsync 所有数据页（大、随机写）。
 
-我们的简易引擎没有 WAL，进程崩了就什么都没了——这也是为什么 demo 跑完关掉进程，数据就消失的原因。
+我们的简易引擎正常关闭时会把脏页刷到文件；demo 的数据消失是因为示例最后主动执行了 `DROP TABLE`。但它没有 WAL，因此若进程在多步修改中途崩溃，无法回滚或重放部分完成的操作，也不能提供事务持久性保证。
 
 **English**
 
@@ -302,7 +302,7 @@ PostgreSQL's answer is **WAL (Write-Ahead Log)**: every modification is written 
 
 Recovery then just replays the WAL: starting from the last checkpoint's position, reapply every "committed but not-yet-flushed" modification. Commit also gets faster — you only need to `fsync` the WAL file (small, sequential) instead of fsyncing every data page (large, random).
 
-Our small engine has no WAL — kill the process and everything is gone. This is exactly why our `demo` "loses" its data as soon as the process exits.
+Our engine flushes dirty pages during a normal close; the demo removes its data because it explicitly runs `DROP TABLE`. Without WAL, a crash during a multi-step change cannot be rolled back or replayed, so transactional durability is not guaranteed.
 
 ---
 

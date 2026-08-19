@@ -26,6 +26,7 @@
 #include "record_mgr.h"
 #include "btree_mgr.h"
 #include "ddl_parser.h"
+#include "catalog.h"
 
 /* helper: build a Record from (id, name, age) and insert into table + index */
 static RC insertUser(RM_TableData *tbl, BTreeHandle *idx,
@@ -65,6 +66,7 @@ int main(void)
     /* ---- 1. init ---- */
     initRecordManager(NULL);
     initIndexManager(NULL);
+    initCatalog();
 
     /* clean up any leftovers from a previous run */
     deleteTable("USERS");
@@ -141,6 +143,7 @@ int main(void)
     executeDDL("DROP TABLE users");
 
     shutdownIndexManager();
+    shutdownCatalog();
     shutdownRecordManager();
     printf("== done ==\n");
     return 0;

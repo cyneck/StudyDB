@@ -393,7 +393,7 @@ RC insertRecord(RM_TableData *rel, Record *record) {
 
 **English**
 
-`insertRecord` flow: **walk pages from page 1 → count occupied slots per page → if there is room, insert → backfill RID**. No data-page count is kept on page 0 — `pinPage` auto-grows the file when asked for a page that does not exist yet (chapter 2), so the loop naturally opens a new page when it reaches the end of the table:
+`insertRecord` flow: **walk pages from page 1 → find the first marker that is not `'+'` → insert → backfill RID**. This reuses both never-used (`'\0'`) slots and delete tombstones (`'-'`). No data-page count is kept on page 0 — `pinPage` auto-grows the file when asked for a page that does not exist yet (chapter 2), so the loop naturally opens a new page when it reaches the end of the table:
 
 ```c
 // (same code as above)
@@ -401,8 +401,8 @@ RC insertRecord(RM_TableData *rel, Record *record) {
 
 Key points:
 
-- **Page-full check by counting slots**: each page's `numSlots` markers are scanned and the `'+'` ones counted; fewer than `numSlots` means there is room. Costs O(slots per page), but it is simple and easy to follow.
-- **Insert position = count of occupied slots**: the new record lands in the slot right after the last occupied one, rather than the first free slot — so tombstone (`'-'`) slots left by deletes are not immediately reused (see the discussion in 3.4.4).
+- **Page-full check by marker scan**: each page's `numSlots` markers are scanned until the first marker other than `'+'` is found. This is O(slots per page), but it is simple and reuses holes.
+- **Insert position = first free slot**: tombstones left by deletes are reused before the file grows.
 - **On-demand file growth**: `pinPage` calls `appendEmptyBlock` when `curPageNum` is past the end of the file, so the loop is guaranteed to terminate without manually tracking a "number of data pages".
 - **RID is the return value**: on success, `record->id` is filled with `(page, slot)`, which the caller can pass to `getRecord` / `deleteRecord`.
 - **`markDirty` + `unpin`**: only marks the page dirty and releases the pin; the actual flush is left to the buffer pool (`forceFlushPool` at close), not per-insert.
@@ -474,7 +474,7 @@ Directly erasing a record from a page would break the `slot × (recordSize + 2)`
 Scans (3.4.5) skip `'-'` slots too. This is the simplest "soft delete":
 
 - **Pro**: dead-simple, doesn't disturb RID addressing — `RID = (page, slot)` means the same thing before and after a delete; a tombstone costs only 1 marker byte.
-- **Con**: space is not fully reclaimed — the file never shrinks and emptied pages stay at the end; inserts land at the "count of occupied slots" index rather than actively reusing tombstone slots (see 3.4.3), so repeated insert/delete cycles can leave the file "bloated".
+- **Con**: tombstone slots are reused, but the file never shrinks and completely empty tail pages are not truncated, so repeated growth can still leave the file larger than necessary.
 
 ---
 

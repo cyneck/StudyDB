@@ -25,6 +25,7 @@ static void testParseUpdateDelete(void);
 static void testExecuteInsertSelect(void);
 static void testWhereFilter(void);
 static void testCatalogIntegration(void);
+static void testDuplicatePrimaryKey(void);
 
 char *testName;
 
@@ -42,12 +43,36 @@ main(void)
     testExecuteInsertSelect();
     testWhereFilter();
     testCatalogIntegration();
+    testDuplicatePrimaryKey();
 
     shutdownCatalog();
     shutdownIndexManager();
     shutdownRecordManager();
     printf("ALL DML TESTS PASSED\n");
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+static void
+testDuplicatePrimaryKey(void)
+{
+    testName = "dml: duplicate primary key keeps table and index consistent";
+    catalogDropTable("DUPKEY");
+    deleteTable("DUPKEY");
+    deleteBTree("DUPKEY.idx");
+
+    TEST_CHECK(executeDDL("CREATE TABLE dupkey (id INT, value INT, PRIMARY KEY (id))"));
+    TEST_CHECK(executeSQL("INSERT INTO dupkey VALUES (1, 10)"));
+    ASSERT_EQUALS_INT(RC_IM_KEY_ALREADY_EXISTS,
+                      executeSQL("INSERT INTO dupkey VALUES (1, 20)"),
+                      "duplicate primary key is rejected");
+
+    RM_TableData table;
+    TEST_CHECK(openTable(&table, "DUPKEY"));
+    ASSERT_EQUALS_INT(1, getNumTuples(&table), "failed index insert leaves no orphan row");
+    TEST_CHECK(closeTable(&table));
+    TEST_CHECK(executeDDL("DROP TABLE dupkey"));
+    TEST_DONE();
 }
 
 /* ------------------------------------------------------------------ */

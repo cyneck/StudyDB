@@ -181,21 +181,27 @@ cmpKeys(const Value *a, const Value *b)
 /* ================================================================== */
 
 static int nodeGetIsLeaf(BT_MgmtData *md, char *data) {
+    (void)md;
     int v; memcpy(&v, data + OFF_ISLEAF(md), sizeof(int)); return v;
 }
 static void nodeSetIsLeaf(BT_MgmtData *md, char *data, int v) {
+    (void)md;
     memcpy(data + OFF_ISLEAF(md), &v, sizeof(int));
 }
 static int nodeGetNumKeys(BT_MgmtData *md, char *data) {
+    (void)md;
     int v; memcpy(&v, data + OFF_NUMKEYS(md), sizeof(int)); return v;
 }
 static void nodeSetNumKeys(BT_MgmtData *md, char *data, int v) {
+    (void)md;
     memcpy(data + OFF_NUMKEYS(md), &v, sizeof(int));
 }
 static int nodeGetNext(BT_MgmtData *md, char *data) {
+    (void)md;
     int v; memcpy(&v, data + OFF_NEXT(md), sizeof(int)); return v;
 }
 static void nodeSetNext(BT_MgmtData *md, char *data, int v) {
+    (void)md;
     memcpy(data + OFF_NEXT(md), &v, sizeof(int));
 }
 

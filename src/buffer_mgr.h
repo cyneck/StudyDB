@@ -14,36 +14,6 @@
 #include "dt.h"
 
 
-#define NO_KEY (-1)
-#define NOT_FOUND (-1)
-#define NO_LIST (-2)
-#define NO_FREE_SLOT (-1)
-
-typedef struct HashNode {
-    int key;
-    int value;
-    struct HashNode *next;
-} HashNode;
-
-typedef struct HashTable {
-    HashNode *hashNode;
-    size_t size;
-} HashTable;
-
-typedef struct FreeListNode {
-    struct FreeListNode *next;
-    int buff_id;
-} FreeListNode;
-
-
-// A linked list with the header node pointer
-typedef struct FreeList {
-    FreeListNode *head;
-} FreeList;
-
-typedef struct FreeList List;
-typedef struct FreeListNode ListNode;
-
 typedef enum ReplacementStrategy {
     RS_FIFO = 0,
     RS_LRU = 1,
@@ -55,42 +25,12 @@ typedef enum ReplacementStrategy {
 
 typedef int PageNumber;
 #define NO_PAGE (-1)
-#define NOT_IN_BUF (-1)
-
-
-typedef struct BM_BufferHeader {
-    unsigned int buff_id;
-    PageNumber pageNumber;
-    bool dirtyPage;
-    bool pinned;
-
-} BufferHeader;
-
-typedef struct BM_BufferStatistics {
-    unsigned int num_reads_disk;
-    unsigned int num_writes_disk;
-    unsigned int num_buff_hits;
-} BufferStats;
-
-
-typedef struct BM_MgmtData {
-    SM_FileHandle *fHandle;
-    char *buffPoolAddr;
-    BufferHeader *buffPoolHeaders;
-    BufferStats buffStats;
-    HashTable *buffTable;
-    FreeList *freeBuffList;
-    int *fixCount;
-    void *strategyData;
-} BM_MgmtData;
-
-
 typedef struct BM_BufferPool {
     char *pageFile;
     int numPages;
     bool isOpen;
     ReplacementStrategy strategy;
-    BM_MgmtData *mgmtData;
+    void *mgmtData; /* private implementation, defined in buffer_mgr.c */
 } BM_BufferPool;
 
 

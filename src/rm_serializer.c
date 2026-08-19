@@ -15,8 +15,8 @@
 // dynamic string
 typedef struct VarString {
     char *buf;
-    int size;
-    int bufsize;
+    size_t size;
+    size_t bufsize;
 } VarString;
 
 #define MAKE_VARSTRING(var)                \
@@ -52,9 +52,10 @@ typedef struct VarString {
         do {                                \
             if (var->bufsize < newsize)                    \
             {                                \
-                int newbufsize = var->bufsize;                \
+                size_t newbufsize = var->bufsize;                \
                 while((newbufsize *= 2) < newsize);            \
                 var->buf = realloc(var->buf, newbufsize);            \
+                var->bufsize = newbufsize;                            \
             }                                \
         } while (0)
 
@@ -66,13 +67,11 @@ typedef struct VarString {
         } while(0)
 
 #define APPEND(var, ...)            \
-        do {                        \
-            char *tmp = malloc(10000); \
-            memset(tmp, '\0', 10000);                        \
-            sprintf(tmp, __VA_ARGS__);            \
-            APPEND_STRING(var,tmp);            \
-            free(tmp);                    \
-        } while(0)
+		do {                        \
+			char tmp[10000]; \
+			snprintf(tmp, sizeof(tmp), __VA_ARGS__);            \
+			APPEND_STRING(var,tmp);            \
+		} while(0)
 
 // prototypes
 static RC attrOffset(Schema *schema, int attrNum, int *result);

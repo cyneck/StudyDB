@@ -48,6 +48,7 @@ int getRecordsPerPage(Schema *schema)
 
 RC initRecordManager(void *mgmtData)
 {
+    (void)mgmtData;
     // Nothing to initialize in this record manager
     return RC_OK;
 }
@@ -377,17 +378,14 @@ RC deleteRecord(RM_TableData *rel, RID id)
     // TableInfo *tableInfo = (TableInfo *)rel->mgmtData;
 
     // Get the page size and record size
-    int pageSize = PAGE_SIZE;
     int recordSize = getRecordSize(rel->schema);
-
-    // Calculate the total number of records that can be stored on a page
     int numSlots = getRecordsPerPage(rel->schema);
 
-    // Check if the RID is valid
-    // if (id.page < 1 || id.page > rel->numTuples || id.slot < 0 || id.slot >= numSlots)
-    // {
-    //     return RC_RM_INVALID_RID;
-    // }
+    // Calculate the total number of records that can be stored on a page
+
+    if (id.page < 1 || id.page >= getTotalNumPages(rel->mgmtData) ||
+        id.slot < 0 || id.slot >= numSlots)
+        return RC_RM_INVALID_RID;
 
     // Pin the page containing the record to delete
     BM_PageHandle pageHandle;
@@ -435,17 +433,12 @@ RC updateRecord(RM_TableData *rel, Record *record)
     // TableInfo *tableInfo = (TableInfo *)rel->mgmtData;
 
     // Get the page size and record size
-    int pageSize = PAGE_SIZE;
     int recordSize = getRecordSize(rel->schema);
 
-    // Calculate the total number of records that can be stored on a page
     int numSlots = getRecordsPerPage(rel->schema);
-
-    // Check if the RID is valid
-    // if (record->id.page < 1 || record->id.page > rel->mgmtData->numPages ||
-    //     record->id.slot < 0 || record->id.slot >= numSlots) {
-    //     return RC_RM_INVALID_RID;
-    // }
+    if (record->id.page < 1 || record->id.page >= getTotalNumPages(rel->mgmtData) ||
+        record->id.slot < 0 || record->id.slot >= numSlots)
+        return RC_RM_INVALID_RID;
 
     // Pin the page containing the record to update
     BM_PageHandle pageHandle;
@@ -491,16 +484,15 @@ RC getRecord(RM_TableData *rel, RID id, Record *record)
     // TableInfo *tableInfo = (TableInfo *)rel->mgmtData;
 
     // Get the page size and record size
-    int pageSize = PAGE_SIZE;
     int recordSize = getRecordSize(rel->schema);
+    int numSlots = getRecordsPerPage(rel->schema);
 
     // Calculate the total number of records that can be stored on a page
     // int numSlots = tableInfo->numSlots;
 
-    // Check if the RID is valid
-    // if (id.page < 1 || id.page > tableInfo->bufferPool->numPages || id.slot < 0 || id.slot >= numSlots) {
-    //     return RC_RM_INVALID_RID;
-    // }
+    if (id.page < 1 || id.page >= getTotalNumPages(rel->mgmtData) ||
+        id.slot < 0 || id.slot >= numSlots)
+        return RC_RM_INVALID_RID;
 
     // Pin the page containing the record to retrieve
     BM_PageHandle pageHandle;
