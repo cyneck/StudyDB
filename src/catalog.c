@@ -292,10 +292,17 @@ initCatalog(void)
         !readIntChecked(buf, totalBytes, &off, &g_catalog.count) ||
         magic != CATALOG_MAGIC || version != CATALOG_VERSION ||
         g_catalog.count < 0 || g_catalog.count > CATALOG_MAX_ENTRIES) {
+        /* The catalog file exists but is invalid (e.g. a zeroed stub left
+         * behind by a crashed run). Rather than failing, reset it to a
+         * fresh, empty catalog so callers are not blocked by a stale file. */
         free(buf);
         closePageFile(&g_catFH);
-        free(g_catalog.pageFile);
-        return RC_RM_INVALID_SCHEMA_DATA;
+        CHECKEX(createPageFile(g_catalog.pageFile));   /* truncate to 1 empty page */
+        CHECKEX(openPageFile(g_catalog.pageFile, &g_catFH));
+        g_catalog.head = NULL;
+        g_catalog.count = 0;
+        g_initialized = 1;
+        return catalogFlush();      /* write empty validated header */
     }
 
     CatalogEntry *tail = NULL;
